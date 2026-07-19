@@ -136,8 +136,9 @@ int main(int argc, char **argv) {
     if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
         fprintf(stderr, "no CUDA device %d\n", device); return 1;
     }
+    // Five contexts can page under WDDM on 32 GB cards and run slower than four.
     if (!pipeline_set && prop.totalGlobalMem >= (28ull << 30))
-        pipeline = TARI_C29_MAX_PIPELINE < 5 ? TARI_C29_MAX_PIPELINE : 5;
+        pipeline = TARI_C29_MAX_PIPELINE < 4 ? TARI_C29_MAX_PIPELINE : 4;
     printf("TARI.Miner C29 solver %s on %s (%.0f GB, sm_%d%d)\n",
            TARI_MINER_VERSION, prop.name, prop.totalGlobalMem / 1e9, prop.major, prop.minor);
     { char hx[65]; for (int i = 0; i < 32; i++) sprintf(hx + 2 * i, "%02x", mining_hash[i]); hx[64] = 0;

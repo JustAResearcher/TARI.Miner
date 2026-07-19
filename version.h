@@ -1,3 +1,3 @@
 #pragma once
 
-#define TARI_MINER_VERSION "1.1.0"
+#define TARI_MINER_VERSION "1.1.1"

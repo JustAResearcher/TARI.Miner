@@ -9,8 +9,8 @@ schedule, or alternate mining connection.
 Open the [latest release](https://github.com/JustAResearcher/TARI.Miner/releases/latest)
 and download one file for your operating system:
 
-- `TARI.Miner-v1.1.0-windows.zip`
-- `TARI.Miner-v1.1.0-linux.tar.gz`
+- `TARI.Miner-v1.1.1-windows.zip`
+- `TARI.Miner-v1.1.1-linux.tar.gz`
 
 Each package contains all supported GPU backends. The starter detects every
 NVIDIA GPU and selects the correct backend for each card:
@@ -27,7 +27,7 @@ The starter does not change GPU clocks, voltage, fans, or power limits.
 
 ## Windows
 
-1. Extract `TARI.Miner-v1.1.0-windows.zip`.
+1. Extract `TARI.Miner-v1.1.1-windows.zip`.
 2. Run `start-c29.bat`.
 3. Paste your Tari wallet address when prompted.
 4. Leave each GPU miner window open while mining.
@@ -51,7 +51,7 @@ start-c29.bat --pipeline 1
 
 ## Linux
 
-Extract `TARI.Miner-v1.1.0-linux.tar.gz`, then run:
+Extract `TARI.Miner-v1.1.1-linux.tar.gz`, then run:
 
 ```bash
 chmod +x start-c29.sh bin/tari_c29_*

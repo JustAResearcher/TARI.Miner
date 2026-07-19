@@ -564,8 +564,9 @@ int main(int argc, char **argv) {
         socket_cleanup();
         return 1;
     }
+    // Five contexts can page under WDDM on 32 GB cards and run slower than four.
     if (!opt.pipeline_set && prop.totalGlobalMem >= (28ull << 30))
-        opt.pipeline = TARI_C29_MAX_PIPELINE < 5 ? TARI_C29_MAX_PIPELINE : 5;
+        opt.pipeline = TARI_C29_MAX_PIPELINE < 4 ? TARI_C29_MAX_PIPELINE : 4;
     printf("TARI.Miner C29 %s on %s (%.0f GB, sm_%d%d)\n",
            TARI_MINER_VERSION, prop.name, prop.totalGlobalMem / 1e9, prop.major, prop.minor);
     printf("pool=%s worker=%s\n", opt.pool.c_str(), opt.worker.c_str());
