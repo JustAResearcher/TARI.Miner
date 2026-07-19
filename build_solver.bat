@@ -5,6 +5,8 @@ setlocal
 set "ROOT=%~dp0"
 set ARCH=%1
 if "%ARCH%"=="" set ARCH=sm_120
+if not exist "%ROOT%bin" mkdir "%ROOT%bin"
+set "OUTPUT=%ROOT%bin\tari_c29_solver_%ARCH%.exe"
 set EXTRA_FLAGS=
 if /I "%ARCH%"=="sm_120" set EXTRA_FLAGS=-DWARP_DST_ATOMICS_LATE=1 -DTARI_C29_DEFAULT_NTRIMS=48 -DSEEDB_REVERSE_LOOP=1 -DROUND0_DST_HASH_DYNAMIC_BITS=12 -DROUND0_DST_HASH_DYNAMIC_PROBES=4 -DROUND0_DST_HASH_FALLBACK_PLAIN=1 -DROUND0_DST_HASH_REPLAY_NORMAL_LOAD=1 -DROUND0_DST_HASH_REVERSE_INSERT=1 -DFUSE_FINAL_TAIL_CURRENT=1 -DFUSE_FINAL_TAIL_COUNT_NORMAL_LOAD=1 -DROUND23_TPB=960 -DROUND1_COUNT_NORMAL_LOAD=1 -DROUND23_COUNT_NORMAL_LOAD=1
 
@@ -22,7 +24,7 @@ echo Building tari_c29_solver for %ARCH% ...
     "%ROOT%tari_c29_solver.cu" ^
     "%ROOT%tari_c29.cpp" ^
     "%CRYPTO%\blake2b-ref.c" ^
-    -o "%ROOT%tari_c29_solver.exe"
+    -o "%OUTPUT%"
 
 if errorlevel 1 (
     echo BUILD FAILED
@@ -30,7 +32,7 @@ if errorlevel 1 (
     exit /b 1
 ) else (
     echo.
-    echo BUILD OK -^> tari_c29_solver.exe
-    echo Try: tari_c29_solver.exe --count 200
+    echo BUILD OK -^> %OUTPUT%
+    echo Try: "%OUTPUT%" --count 200
 )
 endlocal

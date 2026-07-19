@@ -7,6 +7,8 @@ set -euo pipefail
 
 ARCH="${1:-sm_86}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+mkdir -p "$ROOT/bin"
+OUTPUT="$ROOT/bin/tari_c29_solver_$ARCH"
 CUCKOO_ROOT="${CUCKOO_ROOT:-"$ROOT/third_party/cuckoo"}"
 CUCKAROO="$CUCKOO_ROOT/src/cuckaroo"
 CRYPTO="$CUCKOO_ROOT/src/crypto"
@@ -40,6 +42,6 @@ echo "Building tari_c29_solver_linux for $ARCH ..."
     "$ROOT/tari_c29_solver.cu" \
     "$ROOT/tari_c29.cpp" \
     "$CRYPTO/blake2b-ref.c" \
-    -o "$ROOT/tari_c29_solver_linux"
+    -o "$OUTPUT"
 
-echo "BUILD OK -> $ROOT/tari_c29_solver_linux"
+echo "BUILD OK -> $OUTPUT"

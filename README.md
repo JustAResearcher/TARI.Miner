@@ -1,136 +1,136 @@
 # TARI.Miner
 
-TARI.Miner is a community-built, open-source NVIDIA CUDA miner for Tari (XTM)
-Cuckaroo29. It includes a LuckyPool-compatible pool miner and a standalone GPU
-solver for local testing.
-
-**There is no developer fee.** The miner contains no payout address, donation
-schedule, or alternate mining connection. It requires your wallet and mines
-only to that wallet.
+TARI.Miner is an open-source NVIDIA CUDA miner for Tari (XTM) Cuckaroo29.
+It connects to LuckyPool and has no developer fee, payout address, donation
+schedule, or alternate mining connection.
 
 ## Download
 
-Download the package for your GPU from the
-[latest release](https://github.com/JustAResearcher/TARI.Miner/releases/latest):
+Open the [latest release](https://github.com/JustAResearcher/TARI.Miner/releases/latest)
+and download one file for your operating system:
 
-- `windows-sm86`: NVIDIA RTX 30 series
-- `windows-sm89`: NVIDIA RTX 40 series
-- `windows-sm120`: NVIDIA RTX 50 series
-- `linux-sm86-ptx`: RTX 30 series, with PTX for newer-driver JIT
-- `linux-sm120`: native RTX 50 series
+- `TARI.Miner-v1.1.0-windows.zip`
+- `TARI.Miner-v1.1.0-linux.tar.gz`
+
+Each package contains all supported GPU backends. The starter detects every
+NVIDIA GPU and selects the correct backend for each card:
+
+- Compute capability 8.6: RTX 30 series
+- Compute capability 8.9: RTX 40 series
+- Compute capability 12.0: RTX 50 series
+
+Mixed rigs are supported. Each GPU runs in its own process with a worker name
+such as `RIG01-gpu0` or `RIG01-gpu1`. Pipeline depth is also selected inside
+each process from that card's available VRAM.
+
+The starter does not change GPU clocks, voltage, fans, or power limits.
 
 ## Windows
 
-1. Download and extract the correct Windows ZIP.
+1. Extract `TARI.Miner-v1.1.0-windows.zip`.
 2. Run `start-c29.bat`.
 3. Paste your Tari wallet address when prompted.
-4. Leave the miner window open while mining.
+4. Leave each GPU miner window open while mining.
 
-The included BAT file is already configured for
-`taric29-ca.luckypool.io:3111` and uses the Windows computer name as the worker.
-You can edit the variables at the top of the BAT file to make a wallet, worker,
-or pool permanent.
+The BAT file is preconfigured for `taric29-ca.luckypool.io:3111` and uses the
+Windows computer name as the base worker name. To save settings, edit the
+optional variables near the top of `start-c29.bat`.
+
+To mine only on selected GPUs, set a comma-separated device list:
+
+```bat
+set "TARI_DEVICES=0,2"
+start-c29.bat
+```
+
+Extra miner options are applied to every selected GPU:
+
+```bat
+start-c29.bat --pipeline 1
+```
 
 ## Linux
 
-Extract the package, then run:
+Extract `TARI.Miner-v1.1.0-linux.tar.gz`, then run:
 
 ```bash
-chmod +x tari_c29_pool_miner start-c29.sh
-TARI_WALLET=YOUR_TARI_WALLET ./start-c29.sh
+chmod +x start-c29.sh bin/tari_c29_*
+./start-c29.sh
 ```
 
-Optional variables:
+The starter prompts for a wallet in an interactive terminal. Environment
+variables can provide permanent settings:
 
 ```bash
 TARI_POOL=taric29-ca.luckypool.io:3111 \
 TARI_WORKER=RIG01 \
 TARI_WALLET=YOUR_TARI_WALLET \
+TARI_DEVICES=all \
 ./start-c29.sh
 ```
 
-## Direct Command
+Use `TARI_DEVICES=0,2` to select specific GPUs. Press Ctrl+C to stop all GPU
+workers started by the script.
 
-Windows:
+## Miner Options
 
-```bat
-tari_c29_pool_miner.exe --pool taric29-ca.luckypool.io:3111 --wallet YOUR_TARI_WALLET --worker RIG01
-```
-
-Linux:
-
-```bash
-./tari_c29_pool_miner --pool taric29-ca.luckypool.io:3111 --wallet YOUR_TARI_WALLET --worker RIG01
-```
-
-Useful options:
+Options placed after the starter command are passed to every selected GPU:
 
 ```text
 --pool host:port        Pool endpoint
 --wallet WALLET         Required Tari wallet address
---worker NAME           Worker name; defaults to host name
+--worker NAME           Worker name
 --pass VALUE            Pool password; defaults to x
---device N              CUDA device index; defaults to 0
 --pipeline N            Overlapped solver contexts; defaults automatically
 --max-runtime-sec N     Stop after N seconds
 --version               Print version and exit
 ```
 
-Run `tari_c29_pool_miner --help` for the full tuning list. If automatic
-pipeline allocation does not fit in VRAM, retry with `--pipeline 1`.
+The starter supplies `--device`, `--pool`, `--wallet`, and `--worker` after
+user options so each GPU always receives its detected device index and unique
+worker name. If automatic allocation does not fit in VRAM, retry with
+`--pipeline 1`.
 
 The pool connection is plain TCP. Do not use a sensitive password for
 `--pass`; the default `x` is sufficient for LuckyPool.
 
 ## Test The Solver
 
-The standalone solver checks GPU results with an independent CPU verifier:
+The standalone solver checks GPU results with an independent CPU verifier.
+Choose the backend matching the test GPU:
 
-```text
-tari_c29_solver --count 320 --pipeline 2
+```bat
+bin\tari_c29_solver_sm_89.exe --device 0 --count 320 --pipeline 2
+```
+
+```bash
+bin/tari_c29_solver_sm_89 --device 0 --count 320 --pipeline 2
 ```
 
 A correct run ends with `verify failures: 0`.
 
 ## Build From Source
 
-The repository includes the required third-party source under
+The repository includes its required third-party source under
 `third_party/cuckoo`.
 
-Windows requirements:
-
-- Visual Studio with Desktop development with C++
-- NVIDIA CUDA Toolkit 13.2 for RTX 50 series, or a compatible toolkit for the
-  selected architecture
-
-From an x64 Native Tools Command Prompt:
+Windows requires Visual Studio C++ tools and NVIDIA CUDA Toolkit 13.2. From an
+x64 Native Tools Command Prompt:
 
 ```bat
 build.bat
-build_solver.bat sm_120
-build_pool_miner.bat sm_120
+build_all.bat
 ```
 
-Use `sm_89` for RTX 40 series or `sm_86` for RTX 30 series. Set `NVCC` to the
-full CUDA compiler path when it is not installed in the default CUDA 13.2
-location.
-
-Linux:
+Linux requires a C++ toolchain and an NVIDIA CUDA toolkit that supports all
+three target architectures:
 
 ```bash
-./build_solver.sh sm_86
-./build_pool_miner.sh sm_86
+./build_all.sh
 ```
 
-For RTX 50 series:
-
-```bash
-NVCC=/usr/local/cuda-13.2/bin/nvcc ./build_solver.sh sm_120
-NVCC=/usr/local/cuda-13.2/bin/nvcc ./build_pool_miner.sh sm_120
-```
-
-Run `build.bat` on Windows to execute the offline CPU test suite. A passing run
-reports `ALL PASSED (0 failures)`.
+Individual backends can be built with `build_solver` or `build_pool_miner` and
+one of `sm_86`, `sm_89`, or `sm_120`.
 
 ## License
 

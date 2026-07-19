@@ -1,4 +1,5 @@
 # Build products
+/bin/
 *.exe
 *.obj
 *.o

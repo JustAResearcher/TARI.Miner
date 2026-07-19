@@ -1,4 +1,4 @@
-TARI.Miner C29 v1.0.0
+TARI.Miner C29 v1.1.0
 =====================
 
 Community Tari Cuckaroo29 CUDA miner. No developer fee.
@@ -7,27 +7,27 @@ Windows quick start
 -------------------
 1. Run start-c29.bat.
 2. Paste your Tari wallet address when prompted.
-3. Keep the miner window open.
+3. Leave each GPU miner window open.
 
-The starter is already configured for:
+The starter is preconfigured for:
   Pool: taric29-ca.luckypool.io:3111
-  Worker: your Windows computer name
+  Worker: your Windows computer name, plus -gpu0, -gpu1, and so on
+  GPUs: all supported NVIDIA cards
 
-To save your settings, edit start-c29.bat and set TARI_WALLET, TARI_WORKER,
-or TARI_POOL near the top.
+The correct backend is selected separately for every RTX 30, RTX 40, and RTX
+50 series GPU, including mixed-card rigs. The starter does not change clocks,
+voltage, fans, or power limits.
 
-Direct command
---------------
-tari_c29_pool_miner.exe --pool taric29-ca.luckypool.io:3111 --wallet YOUR_TARI_WALLET --worker RIG01
+To save settings, edit the optional TARI_WALLET, TARI_WORKER, or TARI_DEVICES
+lines near the top of start-c29.bat. Use TARI_DEVICES=0,2 to mine only on
+those device indexes.
 
-Useful options
---------------
---device N
---pipeline N
---max-runtime-sec N
---help
+Extra options
+-------------
+start-c29.bat --pipeline 1
 
-If VRAM allocation fails, add --pipeline 1.
+Options after start-c29.bat are applied to every selected GPU. If automatic
+VRAM allocation fails, use --pipeline 1.
 
-The standalone tari_c29_solver.exe is for local testing. A correct run ends
-with "verify failures: 0".
+The standalone solver backends are in bin. A correct solver test ends with
+"verify failures: 0".
