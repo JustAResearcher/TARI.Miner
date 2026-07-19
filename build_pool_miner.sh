@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Linux build for the LuckyPool-compatible Tari C29 miner.
+# Default sm_86 works with the PATH CUDA 11.5 toolkit and includes PTX for
+# forward JIT. With a newer toolkit, pass NVCC=/path/to/nvcc and sm_89/sm_120.
+
+ARCH="${1:-sm_86}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CUCKOO_ROOT="${CUCKOO_ROOT:-"$ROOT/third_party/cuckoo"}"
+CUCKAROO="$CUCKOO_ROOT/src/cuckaroo"
+CRYPTO="$CUCKOO_ROOT/src/crypto"
+NVCC="${NVCC:-nvcc}"
+NVCC_HOST="${NVCC_HOST:-}"
+XBITS="${XBITS:-7}"
+IDXSHIFT="${IDXSHIFT:-9}"
+MAXRREGCOUNT="${MAXRREGCOUNT:-96}"
+STD="${STD:-c++17}"
+
+COMPUTE="compute_${ARCH#sm_}"
+HOST_FLAGS=()
+if [[ -n "$NVCC_HOST" ]]; then
+    HOST_FLAGS=(-ccbin "$NVCC_HOST" --allow-unsupported-compiler)
+fi
+EXTRA_FLAGS=()
+if [[ "$ARCH" == "sm_120" ]]; then
+    EXTRA_FLAGS=(-DWARP_DST_ATOMICS_LATE=1 -DTARI_C29_DEFAULT_NTRIMS=48 -DSEEDB_REVERSE_LOOP=1 -DROUND0_DST_HASH_DYNAMIC_BITS=12 -DROUND0_DST_HASH_DYNAMIC_PROBES=4 -DROUND0_DST_HASH_FALLBACK_PLAIN=1 -DROUND0_DST_HASH_REPLAY_NORMAL_LOAD=1 -DROUND0_DST_HASH_REVERSE_INSERT=1 -DFUSE_FINAL_TAIL_CURRENT=1 -DFUSE_FINAL_TAIL_COUNT_NORMAL_LOAD=1 -DROUND23_TPB=960 -DROUND1_COUNT_NORMAL_LOAD=1 -DROUND23_COUNT_NORMAL_LOAD=1)
+fi
+
+echo "Building tari_c29_pool_miner_linux for $ARCH ..."
+"$NVCC" "${HOST_FLAGS[@]}" -O3 -std="$STD" --default-stream per-thread -DXBITS="$XBITS" -DIDXSHIFT="$IDXSHIFT" -DGRAPH_UNION_SKIP=1 -DSOLVER_PRELAUNCH_NEXT=1 -DRECOVERY_SMALL_OUTPUT=1 -DSEEDA_REHASH=1 \
+    "${EXTRA_FLAGS[@]}" \
+    -maxrregcount="$MAXRREGCOUNT" -Xptxas -flcm=cg \
+    -gencode "arch=$COMPUTE,code=$ARCH" \
+    -gencode "arch=$COMPUTE,code=$COMPUTE" \
+    -I"$ROOT" \
+    -I"$ROOT/compat" \
+    -I"$CUCKAROO" \
+    -I"$CRYPTO" \
+    "$ROOT/tari_c29_pool_miner.cu" \
+    "$ROOT/tari_c29.cpp" \
+    "$CRYPTO/blake2b-ref.c" \
+    -o "$ROOT/tari_c29_pool_miner_linux"
+
+echo "BUILD OK -> $ROOT/tari_c29_pool_miner_linux"

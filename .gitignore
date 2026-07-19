@@ -1,0 +1,27 @@
+# Build products
+*.exe
+*.obj
+*.o
+*.pdb
+*.exp
+*.lib
+*_linux
+
+# Release staging
+dist/
+release/
+*.zip
+*.tar.gz
+SHA256SUMS.txt
+
+# Local captures and tuning probes
+*.jsonl
+_*
+*.log
+
+# Editor and OS files
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
