@@ -11,7 +11,7 @@ and download one file for your operating system:
 
 - `TARI.Miner-v1.1.2-windows.zip`
 - `TARI.Miner-v1.1.2-linux.tar.gz`
-- `tari-miner-1.1.2.tar.gz` for HiveOS
+- `tari-miner-hiveos-1.1.2.tar.gz` for HiveOS
 
 Each package contains all supported GPU backends. The starter detects every
 NVIDIA GPU and selects the correct backend for each card:
@@ -77,8 +77,8 @@ workers started by the script.
 Create a Custom miner in the Flight Sheet with these values:
 
 ```text
-Miner name: tari-miner
-Installation URL: https://github.com/JustAResearcher/TARI.Miner/releases/download/v1.1.2/tari-miner-1.1.2.tar.gz
+Miner name: tari-miner-hiveos
+Installation URL: https://github.com/JustAResearcher/TARI.Miner/releases/download/v1.1.2/tari-miner-hiveos-1.1.2.tar.gz
 Hash algorithm: cuckaroo29
 Wallet and worker template: %WAL%.%WORKER_NAME%
 Pool URL: stratum+tcp://taric29-ca.luckypool.io:3111

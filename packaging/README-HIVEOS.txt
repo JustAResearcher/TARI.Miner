@@ -9,9 +9,9 @@ HiveOS custom miner setup
 2. Create a Flight Sheet and choose "Configure in miner" for the pool.
 3. Select Custom miner and use these values:
 
-   Miner name: tari-miner
+   Miner name: tari-miner-hiveos
    Installation URL:
-   https://github.com/JustAResearcher/TARI.Miner/releases/download/v1.1.2/tari-miner-1.1.2.tar.gz
+   https://github.com/JustAResearcher/TARI.Miner/releases/download/v1.1.2/tari-miner-hiveos-1.1.2.tar.gz
    Hash algorithm: cuckaroo29
    Wallet and worker template: %WAL%.%WORKER_NAME%
    Pool URL: stratum+tcp://taric29-ca.luckypool.io:3111
@@ -41,7 +41,7 @@ It does not change clocks, voltage, fans, or power limits.
 Manual reinstall on a rig
 -------------------------
 /hive/miners/custom/custom-get \
-  https://github.com/JustAResearcher/TARI.Miner/releases/download/v1.1.2/tari-miner-1.1.2.tar.gz \
+  https://github.com/JustAResearcher/TARI.Miner/releases/download/v1.1.2/tari-miner-hiveos-1.1.2.tar.gz \
   -f
 
 Then reapply the Flight Sheet or run `miner restart`.

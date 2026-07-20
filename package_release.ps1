@@ -19,12 +19,19 @@ $StageRoot = Join-Path $Dist "staging\v$Version"
 $ReleaseRoot = Join-Path $Dist 'release'
 $RootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
 $StageFull = [IO.Path]::GetFullPath($StageRoot)
+$ReleaseFull = [IO.Path]::GetFullPath($ReleaseRoot)
 if (-not $StageFull.StartsWith($RootFull, [StringComparison]::OrdinalIgnoreCase)) {
     throw "Refusing to stage outside the repository: $StageFull"
+}
+if (-not $ReleaseFull.StartsWith($RootFull, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Refusing to package outside the repository: $ReleaseFull"
 }
 
 if (Test-Path -LiteralPath $StageRoot) {
     Remove-Item -LiteralPath $StageRoot -Recurse -Force
+}
+if (Test-Path -LiteralPath $ReleaseRoot) {
+    Remove-Item -LiteralPath $ReleaseRoot -Recurse -Force
 }
 New-Item -ItemType Directory -Force -Path $StageRoot, $ReleaseRoot | Out-Null
 
@@ -64,7 +71,7 @@ foreach ($Package in $Packages) {
     }
 }
 
-$HiveName = 'tari-miner'
+$HiveName = 'tari-miner-hiveos'
 $HiveStage = Join-Path $StageRoot $HiveName
 $HiveBin = Join-Path $HiveStage 'bin'
 New-Item -ItemType Directory -Force -Path $HiveBin | Out-Null
@@ -189,9 +196,9 @@ RTX 50 backend for each card, including mixed-card rigs.
 
 ## HiveOS
 
-Use a Custom miner with name `tari-miner` and installation URL:
+Use a Custom miner with name `tari-miner-hiveos` and installation URL:
 
-`https://github.com/JustAResearcher/TARI.Miner/releases/download/v{0}/tari-miner-{0}.tar.gz`
+`https://github.com/JustAResearcher/TARI.Miner/releases/download/v{0}/tari-miner-hiveos-{0}.tar.gz`
 
 Set the wallet template to `%WAL%.%WORKER_NAME%`, pool URL to
 `stratum+tcp://taric29-ca.luckypool.io:3111`, and pass to `x`.
