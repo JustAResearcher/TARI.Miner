@@ -6,6 +6,7 @@ TARI_POOL="${TARI_POOL:-taric29-ca.luckypool.io:3111}"
 TARI_WORKER="${TARI_WORKER:-$(hostname)}"
 TARI_DEVICES="${TARI_DEVICES:-all}"
 TARI_NVIDIA_SMI="${TARI_NVIDIA_SMI:-nvidia-smi}"
+TARI_LOG_DIR="${TARI_LOG_DIR:-}"
 MINER_ARGS=("$@")
 
 if [[ -z "${TARI_WALLET:-}" ]]; then
@@ -83,6 +84,16 @@ while IFS=',' read -r raw_index raw_cap raw_name; do
         printf '[DRY RUN]'
         printf ' %q' "${command[@]}"
         printf '\n'
+    elif [[ -n "$TARI_LOG_DIR" ]]; then
+        mkdir -p "$TARI_LOG_DIR"
+        log_file="$TARI_LOG_DIR/gpu$index.log"
+        : > "$log_file"
+        logged_command=("${command[@]}")
+        if command -v stdbuf >/dev/null 2>&1; then
+            logged_command=(stdbuf -oL -eL "${command[@]}")
+        fi
+        "${logged_command[@]}" > >(tee -a "$log_file") 2>&1 &
+        pids+=("$!")
     else
         "${command[@]}" &
         pids+=("$!")

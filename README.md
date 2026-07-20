@@ -9,8 +9,9 @@ schedule, or alternate mining connection.
 Open the [latest release](https://github.com/JustAResearcher/TARI.Miner/releases/latest)
 and download one file for your operating system:
 
-- `TARI.Miner-v1.1.1-windows.zip`
-- `TARI.Miner-v1.1.1-linux.tar.gz`
+- `TARI.Miner-v1.1.2-windows.zip`
+- `TARI.Miner-v1.1.2-linux.tar.gz`
+- `tari-miner-1.1.2.tar.gz` for HiveOS
 
 Each package contains all supported GPU backends. The starter detects every
 NVIDIA GPU and selects the correct backend for each card:
@@ -27,7 +28,7 @@ The starter does not change GPU clocks, voltage, fans, or power limits.
 
 ## Windows
 
-1. Extract `TARI.Miner-v1.1.1-windows.zip`.
+1. Extract `TARI.Miner-v1.1.2-windows.zip`.
 2. Run `start-c29.bat`.
 3. Paste your Tari wallet address when prompted.
 4. Leave each GPU miner window open while mining.
@@ -51,10 +52,9 @@ start-c29.bat --pipeline 1
 
 ## Linux
 
-Extract `TARI.Miner-v1.1.1-linux.tar.gz`, then run:
+Extract `TARI.Miner-v1.1.2-linux.tar.gz`, then run:
 
 ```bash
-chmod +x start-c29.sh bin/tari_c29_*
 ./start-c29.sh
 ```
 
@@ -71,6 +71,24 @@ TARI_DEVICES=all \
 
 Use `TARI_DEVICES=0,2` to select specific GPUs. Press Ctrl+C to stop all GPU
 workers started by the script.
+
+## HiveOS
+
+Create a Custom miner in the Flight Sheet with these values:
+
+```text
+Miner name: tari-miner
+Installation URL: https://github.com/JustAResearcher/TARI.Miner/releases/download/v1.1.2/tari-miner-1.1.2.tar.gz
+Hash algorithm: cuckaroo29
+Wallet and worker template: %WAL%.%WORKER_NAME%
+Pool URL: stratum+tcp://taric29-ca.luckypool.io:3111
+Pass: x
+```
+
+The HiveOS launcher uses every supported GPU unless Extra config arguments
+contains a selector such as `TARI_DEVICES=0,2`. Other extra arguments are
+passed to each miner process, for example `--pipeline 1`. Per-GPU graph rates,
+temperatures, fans, and share counters are reported to the HiveOS agent.
 
 ## Miner Options
 

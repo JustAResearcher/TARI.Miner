@@ -1,4 +1,4 @@
-TARI.Miner C29 v1.1.1
+TARI.Miner C29 v1.1.2
 =====================
 
 Community Tari Cuckaroo29 CUDA miner. No developer fee.
@@ -6,9 +6,7 @@ Community Tari Cuckaroo29 CUDA miner. No developer fee.
 Linux quick start
 -----------------
 1. Open a terminal in this folder.
-2. Make the files executable:
-     chmod +x start-c29.sh bin/tari_c29_*
-3. Start mining:
+2. Start mining:
      ./start-c29.sh
 
 The starter prompts for your wallet and is preconfigured for:
