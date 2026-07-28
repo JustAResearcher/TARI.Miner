@@ -31,7 +31,16 @@ The starter does not change GPU clocks, voltage, fans, or power limits.
 1. Extract `TARI.Miner-v1.1.2-windows.zip`.
 2. Run `start-c29.bat`.
 3. Paste your Tari wallet address when prompted.
-4. Leave each GPU miner window open while mining.
+4. Leave the starter window open while mining.
+
+`start-c29.bat` runs `start-c29.ps1`, which does the work. Both files must stay
+in the same folder. Windows PowerShell 5.1 is included with Windows, so nothing
+needs installing.
+
+Every GPU worker runs inside the starter's own window rather than a window of
+its own, and the starter stays open until the last worker has exited. Press
+Ctrl+C there to stop them all at once: workers share the starter's console so
+that a single interrupt reaches every one of them.
 
 The BAT file is preconfigured for `taric29-ca.luckypool.io:3111` and uses the
 Windows computer name as the base worker name. To save settings, edit the
@@ -41,6 +50,27 @@ To mine only on selected GPUs, set a comma-separated device list:
 
 ```bat
 set "TARI_DEVICES=0,2"
+start-c29.bat
+```
+
+To write per-GPU output to files instead of the console, set a log directory:
+
+```bat
+set "TARI_LOG_DIR=%CD%\logs"
+start-c29.bat
+```
+
+Each worker writes progress to `gpu0.log`, `gpu1.log`, and so on, including the
+periodic speed report. Warnings and connection errors go to `gpu0.err.log`
+alongside it. The two streams are separate files on Windows; the Linux starter
+combines them into one.
+
+Pools that expect `wallet/worker` rather than `wallet.worker` need the login
+separator set alongside the pool:
+
+```bat
+set "TARI_POOL=xtm-c29.kryptex.network:7040"
+set "TARI_LOGIN_SEPARATOR=/"
 start-c29.bat
 ```
 
