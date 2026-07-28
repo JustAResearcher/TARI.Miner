@@ -39,13 +39,13 @@ $Packages = @(
     @{
         Name = "TARI.Miner-v$Version-windows"
         Readme = 'packaging\README.txt'
-        Starter = 'start-c29.bat'
+        Starter = @('start-c29.bat', 'start-c29.ps1')
         Suffix = '.exe'
     },
     @{
         Name = "TARI.Miner-v$Version-linux"
         Readme = 'packaging\README-LINUX.txt'
-        Starter = 'start-c29.sh'
+        Starter = @('start-c29.sh')
         Suffix = ''
     }
 )
@@ -56,7 +56,9 @@ foreach ($Package in $Packages) {
     $StageBin = Join-Path $Stage 'bin'
     New-Item -ItemType Directory -Force -Path $StageBin | Out-Null
     Copy-Item -LiteralPath (Join-Path $Root $Package.Readme) -Destination (Join-Path $Stage 'README.txt')
-    Copy-Item -LiteralPath (Join-Path $Root $Package.Starter) -Destination $Stage
+    foreach ($StarterFile in $Package.Starter) {
+        Copy-Item -LiteralPath (Join-Path $Root $StarterFile) -Destination $Stage
+    }
     Copy-Item -LiteralPath (Join-Path $Root 'LICENSE') -Destination $Stage
     Copy-Item -LiteralPath (Join-Path $Root 'THIRD_PARTY_NOTICES.md') -Destination $Stage
 
