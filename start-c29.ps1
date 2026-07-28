@@ -120,37 +120,55 @@ if (-not [string]::IsNullOrEmpty($logDir) -and -not (Test-Path -LiteralPath $log
 }
 
 $workers = @()
-foreach ($item in $plan) {
-    $startArgs = @{
-        FilePath     = $item.Backend
-        ArgumentList = $item.Args
-        NoNewWindow  = $true
-        PassThru     = $true
-        WorkingDirectory = $root
-    }
-    if (-not [string]::IsNullOrEmpty($logDir)) {
-        # Start-Process cannot send both streams to one file, so progress and
-        # diagnostics are split. Tools read the progress log; the speed report,
-        # which carries hashrate and share counts, is written to stdout.
-        $startArgs.RedirectStandardOutput = Join-Path $logDir "gpu$($item.Index).log"
-        $startArgs.RedirectStandardError  = Join-Path $logDir "gpu$($item.Index).err.log"
-    }
-    $workers += Start-Process @startArgs
-}
-
-Write-Host "Started $($workers.Count) miner worker(s) from $detected detected NVIDIA GPU(s)."
-if (-not [string]::IsNullOrEmpty($logDir)) {
-    Write-Host "Worker output: $logDir\gpu<index>.log and gpu<index>.err.log"
-}
-Write-Host 'Press Ctrl+C to stop all GPU workers.'
-
+$workerFailed = $false
 try {
+    foreach ($item in $plan) {
+        $startArgs = @{
+            FilePath     = $item.Backend
+            ArgumentList = $item.Args
+            NoNewWindow  = $true
+            PassThru     = $true
+            WorkingDirectory = $root
+            ErrorAction  = 'Stop'
+        }
+        if (-not [string]::IsNullOrEmpty($logDir)) {
+            # Start-Process cannot send both streams to one file, so progress and
+            # diagnostics are split. Tools read the progress log; the speed report,
+            # which carries hashrate and share counts, is written to stdout.
+            $startArgs.RedirectStandardOutput = Join-Path $logDir "gpu$($item.Index).log"
+            $startArgs.RedirectStandardError  = Join-Path $logDir "gpu$($item.Index).err.log"
+        }
+        $process = Start-Process @startArgs
+        # Windows PowerShell 5.1 only retains the native process handle after it
+        # has been accessed. Keep it so ExitCode remains available after exit.
+        [void]$process.Handle
+        $workers += $process
+    }
+
+    Write-Host "Started $($workers.Count) miner worker(s) from $detected detected NVIDIA GPU(s)."
+    if (-not [string]::IsNullOrEmpty($logDir)) {
+        Write-Host "Worker output: $logDir\gpu<index>.log and gpu<index>.err.log"
+    }
+    Write-Host 'Press Ctrl+C to stop all GPU workers.'
+
     while ($true) {
         $alive = @($workers | Where-Object { -not $_.HasExited })
         if ($alive.Count -eq 0) { break }
         Start-Sleep -Seconds 2
     }
     Write-Host 'All GPU workers have exited.'
+    foreach ($worker in $workers) {
+        $worker.WaitForExit()
+        $exitCode = $worker.ExitCode
+        if ($exitCode -ne 0) {
+            Write-Host "ERROR: Miner worker PID $($worker.Id) exited with code $exitCode."
+            $workerFailed = $true
+        }
+    }
+}
+catch {
+    Write-Host "ERROR: Failed to start miner worker: $($_.Exception.Message)"
+    $workerFailed = $true
 }
 finally {
     # Runs on Ctrl+C as well as normal completion, so no worker is left behind.
@@ -162,4 +180,5 @@ finally {
 }
 
 if ($missing -gt 0) { exit 5 }
+if ($workerFailed) { exit 1 }
 exit 0
