@@ -462,6 +462,7 @@ struct Options {
     // Character(s) joining wallet and worker in the stratum login. LuckyPool expects
     // "wallet.worker"; some pools, such as Kryptex, expect "wallet/worker".
     std::string login_separator = ".";
+    int intensity = 100;
     int device = 0;
     int pipeline = 2;
     bool pipeline_set = false;
@@ -493,8 +494,9 @@ static void usage() {
            "  --pool host:port        default taric29-ca.luckypool.io:3111\n"
            "  --worker name           default hostname\n"
            "  --pass x                default x\n"
-           "  --login-separator s     joins wallet and worker in the pool login, default \".\"\n"
+    "  --login-separator s     joins wallet and worker in the pool login, default \".\"\n"
            "                          (use \"/\" for pools expecting wallet/worker)\n"
+           "  --intensity N           1-100 percent duty cycle, default 100 (no throttle)\n"
            "  --device N              default 0\n"
            "  --pipeline N            solver contexts to overlap GPU trim and CPU cycle search, default auto\n"
            "  --max-runtime-sec N     stop after N seconds (test helper)\n"
@@ -524,6 +526,7 @@ static bool parse_args(int argc, char **argv, Options &o) {
         else if (!strcmp(argv[i], "--worker")) { char *v = need(argv[i]); if (!v) return false; o.worker = v; }
         else if (!strcmp(argv[i], "--pass")) { char *v = need(argv[i]); if (!v) return false; o.pass = v; }
         else if (!strcmp(argv[i], "--login-separator")) { char *v = need(argv[i]); if (!v) return false; o.login_separator = v; }
+        else if (!strcmp(argv[i], "--intensity")) { char *v = need(argv[i]); if (!v) return false; o.intensity = atoi(v); }
         else if (!strcmp(argv[i], "--device")) { char *v = need(argv[i]); if (!v) return false; o.device = atoi(v); }
         else if (!strcmp(argv[i], "--pipeline")) { char *v = need(argv[i]); if (!v) return false; o.pipeline = atoi(v); o.pipeline_set = true; }
         else if (!strcmp(argv[i], "--max-runtime-sec")) { char *v = need(argv[i]); if (!v) return false; o.max_runtime_sec = atoi(v); }
@@ -547,6 +550,8 @@ static bool parse_args(int argc, char **argv, Options &o) {
         fprintf(stderr, "--wallet is required\n");
         return false;
     }
+    if (o.intensity < 1) o.intensity = 1;
+    if (o.intensity > 100) o.intensity = 100;
     if (o.pipeline < 1) o.pipeline = 1;
     if (o.pipeline > TARI_C29_MAX_PIPELINE) o.pipeline = TARI_C29_MAX_PIPELINE;
     return true;
@@ -704,6 +709,23 @@ int main(int argc, char **argv) {
             }
         };
 
+        // Duty-cycle throttle. Sleeps in proportion to the time worked since the
+        // previous call, so intensity 50 leaves the card idle roughly half the
+        // time and 100 never sleeps at all. The sleep is capped so a new job or
+        // a shutdown is still picked up promptly.
+        double last_resume = now_sec();
+        auto throttle = [&]() {
+            if (opt.intensity >= 100) return;
+            double now = now_sec();
+            double worked = now - last_resume;
+            if (worked > 0.0) {
+                double idle = worked * (100.0 - opt.intensity) / opt.intensity;
+                if (idle > 2.0) idle = 2.0;
+                std::this_thread::sleep_for(std::chrono::duration<double>(idle));
+            }
+            last_resume = now_sec();
+        };
+
         if (opt.pipeline <= 1) while (pool.alive()) {
             elapsed = now_sec() - start;
             if (opt.max_runtime_sec > 0 && elapsed >= opt.max_runtime_sec) break;
@@ -727,6 +749,7 @@ int main(int argc, char **argv) {
             (void)nsols;
             consume_solutions(ctx, job, nonce);
             report_speed();
+            throttle();
         } else {
 #if SOLVER_PRELAUNCH_NEXT
             struct HostEdgeBuffer {
@@ -826,6 +849,7 @@ int main(int argc, char **argv) {
                 consume_solutions(slot_ctx, sol_job, nonce);
                 done++;
                 report_speed();
+                throttle();
             }
             drain_pending();
             for (HostEdgeBuffer &b : edge_buffers) {
@@ -903,6 +927,7 @@ int main(int argc, char **argv) {
                 done++;
                 launch_trim(slot);
                 report_speed();
+                throttle();
             }
             drain_pending();
 #endif

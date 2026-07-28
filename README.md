@@ -131,10 +131,31 @@ Options placed after the starter command are passed to every selected GPU:
 --worker NAME           Worker name
 --pass VALUE            Pool password; defaults to x
 --login-separator S     Joins wallet and worker in the pool login; defaults to .
+--intensity N           Duty cycle from 1 to 100 percent; defaults to 100
 --pipeline N            Overlapped solver contexts; defaults automatically
 --max-runtime-sec N     Stop after N seconds
 --version               Print version and exit
 ```
+
+### Intensity
+
+`--intensity` sets how much of the time the miner works. At 100, the default, it
+never pauses. At 50 it idles for about as long as it works, roughly halving both
+the graph rate and the load on the card. Useful for sharing a GPU with something
+else, or for keeping a laptop cooler and quieter:
+
+```bash
+./start-c29.sh --intensity 50
+```
+
+```bat
+start-c29.bat --intensity 50
+```
+
+This is not the same as `--pipeline`. Pipeline depth controls how many solver
+contexts overlap, which is a memory and latency tuning knob, and lowering it to
+fit VRAM does not reduce how hard the GPU is driven. Intensity inserts idle time
+between graphs and is the setting to reach for when the goal is less load.
 
 The starter supplies `--device`, `--pool`, `--wallet`, and `--worker` after
 user options so each GPU always receives its detected device index and unique
