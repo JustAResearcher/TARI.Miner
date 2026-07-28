@@ -547,6 +547,13 @@ static bool parse_args(int argc, char **argv, Options &o) {
 }
 
 int main(int argc, char **argv) {
+    // stdout is fully buffered when it is not a console, so redirected progress
+    // lines - including the periodic speed report - would sit unflushed for
+    // several kilobytes before reaching a log file, and would be lost entirely
+    // if the process were killed. Line buffering makes redirected output appear
+    // as it is produced, matching what stderr already does.
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+
     Options opt;
     if (!parse_args(argc, argv, opt)) {
         usage();
