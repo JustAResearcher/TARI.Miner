@@ -66,6 +66,7 @@ TARI_POOL=taric29-ca.luckypool.io:3111 \
 TARI_WORKER=RIG01 \
 TARI_WALLET=YOUR_TARI_WALLET \
 TARI_DEVICES=all \
+TARI_LOGIN_SEPARATOR=. \
 ./start-c29.sh
 ```
 
@@ -119,8 +120,13 @@ expecting `wallet/worker`, such as Kryptex, need the separator changed:
 ```bash
 TARI_WALLET=YOUR_TARI_WALLET \
 TARI_POOL=xtm-c29.kryptex.network:7040 \
-./start-c29.sh --login-separator /
+TARI_LOGIN_SEPARATOR=/ \
+./start-c29.sh
 ```
+
+`TARI_LOGIN_SEPARATOR` sits alongside `TARI_POOL` because the two belong
+together: a pool defines both the endpoint and the login format it accepts.
+Passing `--login-separator` after the starter command works as well.
 
 The pool connection is plain TCP. Do not use a sensitive password for
 `--pass`; the default `x` is sufficient for LuckyPool.
