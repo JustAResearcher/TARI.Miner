@@ -459,6 +459,9 @@ struct Options {
     std::string wallet;
     std::string worker;
     std::string pass = "x";
+    // Character(s) joining wallet and worker in the stratum login. LuckyPool expects
+    // "wallet.worker"; some pools, such as Kryptex, expect "wallet/worker".
+    std::string login_separator = ".";
     int device = 0;
     int pipeline = 2;
     bool pipeline_set = false;
@@ -490,6 +493,8 @@ static void usage() {
            "  --pool host:port        default taric29-ca.luckypool.io:3111\n"
            "  --worker name           default hostname\n"
            "  --pass x                default x\n"
+           "  --login-separator s     joins wallet and worker in the pool login, default \".\"\n"
+           "                          (use \"/\" for pools expecting wallet/worker)\n"
            "  --device N              default 0\n"
            "  --pipeline N            solver contexts to overlap GPU trim and CPU cycle search, default auto\n"
            "  --max-runtime-sec N     stop after N seconds (test helper)\n"
@@ -518,6 +523,7 @@ static bool parse_args(int argc, char **argv, Options &o) {
         else if (!strcmp(argv[i], "--wallet")) { char *v = need(argv[i]); if (!v) return false; o.wallet = v; }
         else if (!strcmp(argv[i], "--worker")) { char *v = need(argv[i]); if (!v) return false; o.worker = v; }
         else if (!strcmp(argv[i], "--pass")) { char *v = need(argv[i]); if (!v) return false; o.pass = v; }
+        else if (!strcmp(argv[i], "--login-separator")) { char *v = need(argv[i]); if (!v) return false; o.login_separator = v; }
         else if (!strcmp(argv[i], "--device")) { char *v = need(argv[i]); if (!v) return false; o.device = atoi(v); }
         else if (!strcmp(argv[i], "--pipeline")) { char *v = need(argv[i]); if (!v) return false; o.pipeline = atoi(v); o.pipeline_set = true; }
         else if (!strcmp(argv[i], "--max-runtime-sec")) { char *v = need(argv[i]); if (!v) return false; o.max_runtime_sec = atoi(v); }
@@ -618,7 +624,7 @@ int main(int argc, char **argv) {
         double elapsed = now_sec() - start;
         if (opt.max_runtime_sec > 0 && elapsed >= opt.max_runtime_sec) break;
 
-        std::string login = opt.wallet + "." + opt.worker;
+        std::string login = opt.wallet + opt.login_separator + opt.worker;
         printf("connecting to %s as %s\n", opt.pool.c_str(), login.c_str());
 
         PoolClient pool;

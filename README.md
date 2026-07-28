@@ -99,6 +99,7 @@ Options placed after the starter command are passed to every selected GPU:
 --wallet WALLET         Required Tari wallet address
 --worker NAME           Worker name
 --pass VALUE            Pool password; defaults to x
+--login-separator S     Joins wallet and worker in the pool login; defaults to .
 --pipeline N            Overlapped solver contexts; defaults automatically
 --max-runtime-sec N     Stop after N seconds
 --version               Print version and exit
@@ -108,6 +109,18 @@ The starter supplies `--device`, `--pool`, `--wallet`, and `--worker` after
 user options so each GPU always receives its detected device index and unique
 worker name. If automatic allocation does not fit in VRAM, retry with
 `--pipeline 1`.
+
+### Pool login format
+
+The login sent to the pool is the wallet address, the separator, then the
+worker name. LuckyPool expects `wallet.worker`, which is the default. Pools
+expecting `wallet/worker`, such as Kryptex, need the separator changed:
+
+```bash
+TARI_WALLET=YOUR_TARI_WALLET \
+TARI_POOL=xtm-c29.kryptex.network:7040 \
+./start-c29.sh --login-separator /
+```
 
 The pool connection is plain TCP. Do not use a sensitive password for
 `--pass`; the default `x` is sufficient for LuckyPool.
