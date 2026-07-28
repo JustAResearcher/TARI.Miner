@@ -711,8 +711,8 @@ int main(int argc, char **argv) {
 
         // Duty-cycle throttle. Sleeps in proportion to the time worked since the
         // previous call, so intensity 50 leaves the card idle roughly half the
-        // time and 100 never sleeps at all. The sleep is capped so a new job or
-        // a shutdown is still picked up promptly.
+        // time and 100 never sleeps at all. Pipelined callers first wait for
+        // queued trims so the GPU is actually idle during this sleep.
         double last_resume = now_sec();
         auto throttle = [&]() {
             if (opt.intensity >= 100) return;
@@ -720,8 +720,16 @@ int main(int argc, char **argv) {
             double worked = now - last_resume;
             if (worked > 0.0) {
                 double idle = worked * (100.0 - opt.intensity) / opt.intensity;
-                if (idle > 2.0) idle = 2.0;
-                std::this_thread::sleep_for(std::chrono::duration<double>(idle));
+                double deadline = now + idle;
+                while (pool.alive()) {
+                    double remaining = deadline - now_sec();
+                    if (remaining <= 0.0) break;
+                    if (opt.max_runtime_sec > 0 && now_sec() - start >= opt.max_runtime_sec) break;
+                    Job latest = pool.current_job();
+                    if (latest.seq != 0 && latest.seq != last_seq) break;
+                    std::this_thread::sleep_for(
+                        std::chrono::duration<double>(std::min(remaining, 0.1)));
+                }
             }
             last_resume = now_sec();
         };
@@ -816,6 +824,14 @@ int main(int argc, char **argv) {
                 }
             };
 
+            auto wait_pending = [&]() {
+                if (opt.intensity >= 100) return;
+                for (int slot = 0; slot < opt.pipeline; ++slot) {
+                    if (pending[(size_t)slot].active)
+                        pending[(size_t)slot].future.wait();
+                }
+            };
+
             for (int slot = 0; slot < opt.pipeline; ++slot) {
                 if (!launch_trim(slot)) break;
             }
@@ -849,6 +865,7 @@ int main(int argc, char **argv) {
                 consume_solutions(slot_ctx, sol_job, nonce);
                 done++;
                 report_speed();
+                wait_pending();
                 throttle();
             }
             drain_pending();
@@ -901,6 +918,14 @@ int main(int argc, char **argv) {
                 }
             };
 
+            auto wait_pending = [&]() {
+                if (opt.intensity >= 100) return;
+                for (int slot = 0; slot < opt.pipeline; ++slot) {
+                    if (pending[(size_t)slot].active)
+                        pending[(size_t)slot].future.wait();
+                }
+            };
+
             for (int slot = 0; slot < opt.pipeline; ++slot) {
                 if (!launch_trim(slot)) break;
             }
@@ -927,6 +952,7 @@ int main(int argc, char **argv) {
                 done++;
                 launch_trim(slot);
                 report_speed();
+                wait_pending();
                 throttle();
             }
             drain_pending();
