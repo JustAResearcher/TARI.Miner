@@ -459,8 +459,8 @@ struct Options {
     std::string wallet;
     std::string worker;
     std::string pass = "x";
-    // Character(s) joining wallet and worker in the stratum login. LuckyPool expects
-    // "wallet.worker"; some pools, such as Kryptex, expect "wallet/worker".
+    // Character(s) joining wallet and worker in the stratum login. The default
+    // is "wallet.worker"; other pool deployments may expect "wallet/worker".
     std::string login_separator = ".";
     int intensity = 100;
     int device = 0;

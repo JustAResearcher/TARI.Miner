@@ -69,7 +69,7 @@ Pools that expect `wallet/worker` rather than `wallet.worker` need the login
 separator set alongside the pool:
 
 ```bat
-set "TARI_POOL=xtm-c29.kryptex.network:7040"
+set "TARI_POOL=POOL_HOST:PORT"
 set "TARI_LOGIN_SEPARATOR=/"
 start-c29.bat
 ```
@@ -167,11 +167,11 @@ worker name. If automatic allocation does not fit in VRAM, retry with
 
 The login sent to the pool is the wallet address, the separator, then the
 worker name. LuckyPool expects `wallet.worker`, which is the default. Pools
-expecting `wallet/worker`, such as Kryptex, need the separator changed:
+expecting `wallet/worker` need the separator changed:
 
 ```bash
 TARI_WALLET=YOUR_TARI_WALLET \
-TARI_POOL=xtm-c29.kryptex.network:7040 \
+TARI_POOL=POOL_HOST:PORT \
 TARI_LOGIN_SEPARATOR=/ \
 ./start-c29.sh
 ```
