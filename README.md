@@ -109,8 +109,9 @@ Options placed after the starter command are passed to every selected GPU:
 
 `--intensity` sets how much of the time the miner works. At 100, the default, it
 never pauses. At 50 it idles for about as long as it works, roughly halving both
-the graph rate and the load on the card. Useful for sharing a GPU with something
-else, or for keeping a laptop cooler and quieter:
+the graph rate and the load on the card. Lower values scale the same way, so 25
+works about a quarter of the time. Useful for sharing a GPU with something else,
+or for keeping a laptop cooler and quieter:
 
 ```bash
 ./start-c29.sh --intensity 50
