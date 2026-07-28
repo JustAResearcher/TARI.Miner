@@ -556,9 +556,13 @@ int main(int argc, char **argv) {
     // stdout is fully buffered when it is not a console, so redirected progress
     // lines - including the periodic speed report - would sit unflushed for
     // several kilobytes before reaching a log file, and would be lost entirely
-    // if the process were killed. Line buffering makes redirected output appear
-    // as it is produced, matching what stderr already does.
+    // if the process were killed. Win32 treats _IOLBF as full buffering, so use
+    // unbuffered output there and line buffering on platforms that support it.
+#ifdef _WIN32
+    setvbuf(stdout, nullptr, _IONBF, 0);
+#else
     setvbuf(stdout, nullptr, _IOLBF, 0);
+#endif
 
     Options opt;
     if (!parse_args(argc, argv, opt)) {
