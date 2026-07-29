@@ -18,6 +18,8 @@
 #include <algorithm>
 #include <future>
 
+#include "tari_pool_protocol.h"
+
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
@@ -229,17 +231,6 @@ static bool json_get_uint_from(const std::string &line, const char *key, uint64_
     return end && end != line.c_str() + p;
 }
 
-static uint64_t target_hex_to_diff(const std::string &target_hex) {
-    if (target_hex.size() != 16) return 1;
-    uint8_t b[8];
-    if (!parse_hex_bytes(target_hex, b, sizeof(b))) return 1;
-    uint64_t target = 0;
-    for (int i = 7; i >= 0; --i) target = (target << 8) | b[i]; // pool target is little-endian
-    if (target == 0) return ~0ULL;
-    uint64_t diff = (~0ULL) / target;
-    return diff ? diff : 1;
-}
-
 static uint64_t nonce_prefix_base(const std::string &xn_hex, uint64_t *counter_mask) {
     size_t nbytes = xn_hex.size() / 2;
     if ((xn_hex.size() % 2) || nbytes > 8) {
@@ -279,7 +270,13 @@ struct Job {
     uint64_t seq = 0;
 };
 
-static bool parse_job_line(const std::string &line, Job &current, Job &out) {
+static bool parse_job_line(
+    const std::string &line,
+    Job &current,
+    Job &out,
+    bool *invalid_target
+) {
+    *invalid_target = false;
     size_t start = line.find("\"job\":");
     if (start == std::string::npos) start = line.find("\"params\":");
     if (start == std::string::npos) return false;
@@ -297,7 +294,10 @@ static bool parse_job_line(const std::string &line, Job &current, Job &out) {
     j.blob_hex = blob;
     j.job_id = job_id;
     j.target_hex = target;
-    j.target_diff = target_hex_to_diff(target);
+    if (!tari_pool::target_hex_to_diff(target, j.target_diff)) {
+        *invalid_target = true;
+        return false;
+    }
     j.seq = current.seq + 1;
     out = j;
     return true;
@@ -311,8 +311,9 @@ public:
             fprintf(stderr, "bad --pool, expected host:port\n");
             return false;
         }
-        sock_ = connect_tcp(host, port);
-        if (sock_ == INVALID_SOCK) return false;
+        socket_t socket = connect_tcp(host, port);
+        if (socket == INVALID_SOCK) return false;
+        socket_.set(socket);
         running_.store(true);
         reader_ = std::thread([this]() { read_loop(); });
 
@@ -324,10 +325,13 @@ public:
 
     void stop() {
         running_.store(false);
-        shutdown_socket(sock_);
-        close_socket(sock_);
-        sock_ = INVALID_SOCK;
-        if (reader_.joinable()) reader_.join();
+        socket_.stop(
+            [](socket_t socket) { shutdown_socket(socket); },
+            [this]() {
+                if (reader_.joinable()) reader_.join();
+            },
+            [](socket_t socket) { close_socket(socket); }
+        );
     }
 
     ~PoolClient() {
@@ -392,24 +396,25 @@ public:
 
 private:
     bool send_line(const std::string &line) {
-        std::lock_guard<std::mutex> lk(send_mu_);
-        if (sock_ == INVALID_SOCK) return false;
-        return send_all(sock_, line);
+        return socket_.with_socket([&](socket_t socket) {
+            return send_all(socket, line);
+        });
     }
 
     void read_loop() {
-        std::string buf;
+        tari_pool::LineBuffer lines;
         char tmp[4096];
         while (running_.load()) {
-            int n = recv(sock_, tmp, sizeof(tmp), 0);
+            socket_t socket = socket_.load();
+            if (socket == INVALID_SOCK) break;
+            int n = recv(socket, tmp, sizeof(tmp), 0);
             if (n <= 0) break;
-            buf.append(tmp, tmp + n);
-            size_t pos;
-            while ((pos = buf.find('\n')) != std::string::npos) {
-                std::string line = buf.substr(0, pos);
-                if (!line.empty() && line.back() == '\r') line.pop_back();
-                buf.erase(0, pos + 1);
-                handle_line(line);
+            if (!lines.append(tmp, (size_t)n, [this](const std::string &line) {
+                    if (running_.load()) handle_line(line);
+                })) {
+                fprintf(stderr, "pool sent a line larger than %zu bytes; disconnecting\n",
+                        tari_pool::MAX_LINE_BYTES);
+                break;
             }
         }
         running_.store(false);
@@ -423,7 +428,8 @@ private:
         }
         if (line.find("\"error\"") != std::string::npos && line.find("\"error\":null") == std::string::npos) {
             rejected_.fetch_add(1);
-            printf("pool error/reject: %s\n", line.c_str());
+            std::string safe = tari_pool::sanitize_for_terminal(line);
+            printf("pool error/reject: %s\n", safe.c_str());
             return;
         }
 
@@ -435,18 +441,24 @@ private:
         }
 
         Job parsed;
-        if (parse_job_line(line, job_, parsed)) {
+        bool invalid_target = false;
+        if (parse_job_line(line, job_, parsed, &invalid_target)) {
             job_ = parsed;
+            std::string safe_job_id = tari_pool::sanitize_for_terminal(job_.job_id);
+            std::string safe_xn = tari_pool::sanitize_for_terminal(job_.xn_hex);
             printf("new job height=%llu id=%s diff=%llu xn=%s\n",
-                   (unsigned long long)job_.height, job_.job_id.c_str(),
-                   (unsigned long long)job_.target_diff, job_.xn_hex.c_str());
+                   (unsigned long long)job_.height, safe_job_id.c_str(),
+                   (unsigned long long)job_.target_diff, safe_xn.c_str());
+        } else if (invalid_target) {
+            fprintf(stderr, "invalid pool target; disconnecting\n");
+            running_.store(false);
+            shutdown_socket(socket_.load());
         }
     }
 
-    socket_t sock_ = INVALID_SOCK;
+    tari_pool::SocketState<socket_t, INVALID_SOCK> socket_;
     std::thread reader_;
     mutable std::mutex mu_;
-    std::mutex send_mu_;
     Job job_;
     std::string login_id_;
     std::atomic<bool> running_{false};
