@@ -1,0 +1,179 @@
+// Offline regression tests for pool protocol and transport hardening.
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include "../tari_pool_protocol.h"
+
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <future>
+#include <limits>
+#include <string>
+#include <thread>
+#include <vector>
+
+static int failures = 0;
+
+static void check(bool condition, const char *name) {
+    std::printf("  [%s] %s\n", condition ? "PASS" : "FAIL", name);
+    if (!condition) failures++;
+}
+
+static void test_target_conversion() {
+    std::puts("Pool target conversion:");
+    uint64_t diff = 0;
+    check(tari_pool::target_hex_to_diff("0100000000000000", diff) &&
+              diff == std::numeric_limits<uint64_t>::max(),
+          "little-endian target 1 maps to maximum difficulty");
+    check(tari_pool::target_hex_to_diff("ffffffffffffffff", diff) && diff == 1,
+          "maximum target maps to difficulty 1");
+    check(tari_pool::target_hex_to_diff("0001000000000000", diff) &&
+              diff == std::numeric_limits<uint64_t>::max() / 256,
+          "nontrivial little-endian target is converted exactly");
+    check(tari_pool::target_hex_to_diff("0000000000000000", diff) &&
+              diff == std::numeric_limits<uint64_t>::max(),
+          "zero target remains valid and submits nothing below maximum difficulty");
+
+    diff = 99;
+    check(!tari_pool::target_hex_to_diff("", diff) && diff == 0,
+          "empty target fails closed");
+    diff = 99;
+    check(!tari_pool::target_hex_to_diff("ffffffff", diff) && diff == 0,
+          "wrong-width target fails closed");
+    diff = 99;
+    check(!tari_pool::target_hex_to_diff("gggggggggggggggg", diff) && diff == 0,
+          "non-hex target fails closed");
+}
+
+static void test_terminal_sanitizing() {
+    std::puts("Terminal sanitizing:");
+    const std::string unsafe =
+        std::string("ok") + '\x1b' + "[2J\nbad" + '\x7f' + '\x9b';
+    check(tari_pool::sanitize_for_terminal(unsafe) == "ok.[2J.bad..",
+          "C0 and C1 control characters cannot reach the terminal");
+    check(tari_pool::sanitize_for_terminal("abcdef", 4) == "abcd...",
+          "server text is truncated to the requested limit");
+    check(tari_pool::sanitize_for_terminal("plain text") == "plain text",
+          "ordinary text is unchanged");
+}
+
+static void test_line_buffer() {
+    std::puts("Pool line buffering:");
+    tari_pool::LineBuffer buffer;
+    std::vector<std::string> lines;
+    auto collect = [&](const std::string &line) { lines.push_back(line); };
+
+    check(buffer.append("one", 3, collect) && lines.empty() && buffer.size() == 3,
+          "fragment without newline remains buffered");
+    check(buffer.append("\r\ntwo\npart", 10, collect) &&
+              lines.size() == 2 && lines[0] == "one" && lines[1] == "two" &&
+              buffer.size() == 4,
+          "fragmented CRLF and multiple lines are extracted");
+    check(buffer.append("ial\n", 4, collect) &&
+              lines.size() == 3 && lines[2] == "partial" && buffer.size() == 0,
+          "search resumes at newly appended bytes");
+
+    tari_pool::LineBuffer oversized;
+    const std::string maximum(tari_pool::MAX_LINE_BYTES, 'x');
+    size_t before_maximum = lines.size();
+    check(oversized.append(maximum.data(), maximum.size(), collect) &&
+              oversized.append("\n", 1, collect) &&
+              lines.size() == before_maximum + 1 &&
+              lines.back().size() == tari_pool::MAX_LINE_BYTES &&
+              oversized.size() == 0,
+          "an exactly-at-limit line and its delimiter are accepted");
+
+    const std::string too_large(tari_pool::MAX_LINE_BYTES + 1, 'x');
+    size_t before_oversized = lines.size();
+    check(!oversized.append(too_large.data(), too_large.size(), collect) &&
+              lines.size() == before_oversized &&
+              oversized.size() == 0,
+          "buffer rejects a line beyond the limit without appending it");
+
+    std::string many_lines;
+    const std::string bounded_line(600000, 'x');
+    many_lines.reserve(bounded_line.size() * 2 + 2);
+    many_lines += bounded_line + "\n" + bounded_line + "\n";
+    size_t before_many = lines.size();
+    check(oversized.append(many_lines.data(), many_lines.size(), collect) &&
+              lines.size() == before_many + 2 &&
+              lines[before_many].size() == bounded_line.size() &&
+              lines[before_many + 1].size() == bounded_line.size(),
+          "a large receive containing bounded lines is processed incrementally");
+}
+
+static void test_socket_state() {
+    std::puts("Socket lifecycle:");
+    tari_pool::SocketState<int, -1> state;
+    check(state.load() == -1, "socket starts invalid");
+    state.set(42);
+    bool saw_socket = false;
+    check(state.with_socket([&](int socket) {
+              saw_socket = socket == 42;
+              return true;
+          }) && saw_socket,
+          "send callback receives the active socket");
+
+    std::vector<std::string> events;
+    state.stop(
+        [&](int socket) { events.push_back("shutdown:" + std::to_string(socket)); },
+        [&]() { events.push_back("join"); },
+        [&](int socket) { events.push_back("close:" + std::to_string(socket)); });
+    check(events == std::vector<std::string>({"shutdown:42", "join", "close:42"}),
+          "stop order is shutdown, join, close");
+    check(state.load() == -1 && !state.with_socket([](int) { return true; }),
+          "stopped socket cannot be reused by a sender");
+
+    events.clear();
+    state.stop(
+        [&](int) { events.push_back("shutdown"); },
+        [&]() { events.push_back("join"); },
+        [&](int) { events.push_back("close"); });
+    check(events == std::vector<std::string>({"join"}),
+          "repeated stop remains safe and still joins");
+
+    tari_pool::SocketState<int, -1> concurrent;
+    concurrent.set(7);
+    std::promise<void> send_entered;
+    std::promise<void> release_send;
+    std::shared_future<void> release = release_send.get_future().share();
+    std::vector<std::string> concurrent_events;
+    std::thread sender([&]() {
+        concurrent.with_socket([&](int socket) {
+            check(socket == 7, "concurrent sender sees original socket");
+            send_entered.set_value();
+            release.wait();
+            return true;
+        });
+    });
+    send_entered.get_future().wait();
+    std::thread stopper([&]() {
+        concurrent.stop(
+            [&](int socket) {
+                concurrent_events.push_back("shutdown:" + std::to_string(socket));
+            },
+            [&]() { concurrent_events.push_back("join"); },
+            [&](int socket) {
+                concurrent_events.push_back("close:" + std::to_string(socket));
+            });
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    check(concurrent_events.empty(), "stop waits for an in-flight sender");
+    release_send.set_value();
+    sender.join();
+    stopper.join();
+    check(concurrent_events ==
+              std::vector<std::string>({"shutdown:7", "join", "close:7"}),
+          "concurrent stop preserves socket lifecycle order");
+}
+
+int main() {
+    test_target_conversion();
+    test_terminal_sanitizing();
+    test_line_buffer();
+    test_socket_state();
+    std::printf("\n%s (%d failure%s)\n",
+                failures == 0 ? "ALL PASSED" : "FAILED",
+                failures, failures == 1 ? "" : "s");
+    return failures == 0 ? 0 : 1;
+}

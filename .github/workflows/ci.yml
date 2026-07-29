@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux CPU and script checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and run pool protocol regressions
+        run: |
+          g++ -std=c++17 -O2 -pthread -I. \
+            tests/tari_pool_protocol_test.cpp \
+            -o tests/tari_pool_protocol_test
+          tests/tari_pool_protocol_test
+
+      - name: Build and run Tari wrapper self-test
+        run: |
+          g++ -std=c++17 -O2 \
+            tari_c29.cpp tari_c29_selftest.cpp \
+            -o tari_c29_selftest
+          ./tari_c29_selftest
+
+      - name: Check shell syntax
+        run: |
+          bash -n \
+            start-c29.sh \
+            build_all.sh \
+            build_pool_miner.sh \
+            build_solver.sh \
+            hiveos/h-config.sh \
+            hiveos/h-run.sh \
+            hiveos/h-stats.sh
+
+  windows:
+    name: Windows CPU and launcher checks
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and run C++ regression tests
+        shell: powershell
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $install = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $install) {
+            throw 'Visual Studio C++ tools were not found.'
+          }
+          $command = @(
+            "call `"$install\VC\Auxiliary\Build\vcvars64.bat`" >nul",
+            'cl /nologo /std:c++17 /EHsc /O2 /I. tests\tari_pool_protocol_test.cpp /Fe:tests\tari_pool_protocol_test.exe',
+            'tests\tari_pool_protocol_test.exe',
+            'cl /nologo /std:c++17 /EHsc /O2 tari_c29.cpp tari_c29_selftest.cpp /Fe:tari_c29_selftest.exe',
+            'tari_c29_selftest.exe'
+          ) -join ' && '
+          & cmd.exe /d /s /c $command
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Check PowerShell launcher syntax
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path '.\start-c29.ps1'),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count) {
+            $errors | Format-List
+            exit 1
+          }
