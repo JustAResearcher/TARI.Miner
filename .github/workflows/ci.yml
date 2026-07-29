@@ -14,6 +14,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  cuda-build:
+    name: Linux CUDA 12.8 build matrix
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.8.0-devel-ubuntu22.04
+    steps:
+      - name: Install checkout prerequisites
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            --no-install-recommends ca-certificates git
+          rm -rf /var/lib/apt/lists/*
+
+      - uses: actions/checkout@v4
+
+      - name: Build solver and pool miner for all shipped architectures
+        run: ./build_all.sh
+
   linux:
     name: Linux CPU and script checks
     runs-on: ubuntu-latest
@@ -26,6 +44,13 @@ jobs:
             tests/tari_pool_protocol_test.cpp \
             -o tests/tari_pool_protocol_test
           tests/tari_pool_protocol_test
+
+      - name: Build and run miner reliability regressions
+        run: |
+          g++ -std=c++17 -O2 -I. \
+            tests/tari_miner_reliability_test.cpp \
+            -o tests/tari_miner_reliability_test
+          tests/tari_miner_reliability_test
 
       - name: Build and run Tari wrapper self-test
         run: |
@@ -65,6 +90,8 @@ jobs:
             "call `"$install\VC\Auxiliary\Build\vcvars64.bat`" >nul",
             'cl /nologo /std:c++17 /EHsc /O2 /I. tests\tari_pool_protocol_test.cpp /Fe:tests\tari_pool_protocol_test.exe',
             'tests\tari_pool_protocol_test.exe',
+            'cl /nologo /std:c++17 /EHsc /O2 /I. tests\tari_miner_reliability_test.cpp /Fe:tests\tari_miner_reliability_test.exe',
+            'tests\tari_miner_reliability_test.exe',
             'cl /nologo /std:c++17 /EHsc /O2 tari_c29.cpp tari_c29_selftest.cpp /Fe:tari_c29_selftest.exe',
             'tari_c29_selftest.exe'
           ) -join ' && '
@@ -86,4 +113,10 @@ jobs:
           if ($errors.Count) {
             $errors | Format-List
             exit 1
+          }
+          $manifest = [IO.File]::ReadAllBytes(
+            (Resolve-Path '.\hiveos\h-manifest.conf')
+          )
+          if ($manifest -contains 13) {
+            throw 'HiveOS manifest must use LF line endings.'
           }

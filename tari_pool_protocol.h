@@ -59,6 +59,137 @@ inline std::string sanitize_for_terminal(
     return safe;
 }
 
+inline bool json_find_value_impl(
+    const std::string &json,
+    const char *key,
+    size_t &value_position,
+    size_t start,
+    size_t required_depth
+) {
+    size_t depth = 0;
+    for (size_t i = 0; i < json.size();) {
+        char c = json[i];
+        if (c == '{' || c == '[') {
+            depth++;
+            i++;
+            continue;
+        }
+        if (c == '}' || c == ']') {
+            if (depth) depth--;
+            i++;
+            continue;
+        }
+        if (c != '"') {
+            i++;
+            continue;
+        }
+
+        size_t token_start = ++i;
+        bool escaped = false;
+        while (i < json.size()) {
+            char token_char = json[i];
+            if (escaped) {
+                escaped = false;
+            } else if (token_char == '\\') {
+                escaped = true;
+            } else if (token_char == '"') {
+                break;
+            }
+            i++;
+        }
+        if (i == json.size()) return false;
+        size_t token_end = i++;
+        if (token_start < start ||
+            (required_depth && depth != required_depth) ||
+            token_end - token_start != std::strlen(key) ||
+            json.compare(token_start, token_end - token_start, key) != 0) {
+            continue;
+        }
+
+        while (i < json.size() &&
+               (json[i] == ' ' || json[i] == '\t' ||
+                json[i] == '\r' || json[i] == '\n')) {
+            i++;
+        }
+        if (i == json.size() || json[i++] != ':') continue;
+        while (i < json.size() &&
+               (json[i] == ' ' || json[i] == '\t' ||
+                json[i] == '\r' || json[i] == '\n')) {
+            i++;
+        }
+        if (i == json.size()) return false;
+        value_position = i;
+        return true;
+    }
+    return false;
+}
+
+inline bool json_find_value_from(
+    const std::string &json,
+    const char *key,
+    size_t &value_position,
+    size_t start = 0
+) {
+    return json_find_value_impl(json, key, value_position, start, 0);
+}
+
+inline bool json_find_root_value(
+    const std::string &json,
+    const char *key,
+    size_t &value_position
+) {
+    return json_find_value_impl(json, key, value_position, 0, 1);
+}
+
+inline bool json_root_literal(
+    const std::string &json,
+    const char *key,
+    const char *literal
+) {
+    size_t position = 0;
+    if (!json_find_root_value(json, key, position)) return false;
+    size_t length = std::strlen(literal);
+    if (json.compare(position, length, literal) != 0) return false;
+    size_t end = position + length;
+    if (end == json.size()) return true;
+    char delimiter = json[end];
+    return delimiter == ',' || delimiter == '}' || delimiter == ']' ||
+           delimiter == ' ' || delimiter == '\t' ||
+           delimiter == '\r' || delimiter == '\n';
+}
+
+inline bool json_root_uint(
+    const std::string &json,
+    const char *key,
+    uint64_t &value
+) {
+    size_t position = 0;
+    if (!json_find_root_value(json, key, position) ||
+        position == json.size() ||
+        json[position] < '0' || json[position] > '9') {
+        return false;
+    }
+
+    uint64_t parsed = 0;
+    size_t i = position;
+    for (; i < json.size() && json[i] >= '0' && json[i] <= '9'; ++i) {
+        unsigned digit = (unsigned)(json[i] - '0');
+        if (parsed > (std::numeric_limits<uint64_t>::max() - digit) / 10)
+            return false;
+        parsed = parsed * 10 + digit;
+    }
+    if (i < json.size()) {
+        char delimiter = json[i];
+        if (delimiter != ',' && delimiter != '}' && delimiter != ']' &&
+            delimiter != ' ' && delimiter != '\t' &&
+            delimiter != '\r' && delimiter != '\n') {
+            return false;
+        }
+    }
+    value = parsed;
+    return true;
+}
+
 class LineBuffer {
 public:
     template <typename Handler>

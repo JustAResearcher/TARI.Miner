@@ -23,6 +23,7 @@
 #include <chrono>
 #include <future>
 
+#include "tari_miner_reliability.h"
 #include "version.h"
 
 // --- MSVC host-compiler shims for the reference solver's GNU-isms ---
@@ -84,6 +85,20 @@ static int parse_hex32(const char *hex, uint8_t out[32]) {
     return 0;
 }
 
+static void report_cuda_failure(int device, int context, const char *phase, cudaError_t error) {
+    fprintf(stderr,
+            "fatal: CUDA %s failure on device %d solver context %d: %s (%s); "
+            "exiting for supervisor restart\n",
+            phase, device, context, cudaGetErrorName(error), cudaGetErrorString(error));
+}
+
+static void report_zero_yield_failure(int device, int context) {
+    fprintf(stderr,
+            "fatal: device %d solver context %d returned zero surviving edges for "
+            "%u consecutive graphs; exiting for supervisor restart\n",
+            device, context, tari_miner::MAX_CONSECUTIVE_ZERO_YIELDS);
+}
+
 int main(int argc, char **argv) {
     int device = 0;
     uint64_t start_nonce = 0;
@@ -131,7 +146,11 @@ int main(int argc, char **argv) {
         }
     }
 
-    cudaSetDevice(device);
+    cudaError_t select_rc = cudaSetDevice(device);
+    if (select_rc != cudaSuccess) {
+        fprintf(stderr, "no CUDA device %d: %s\n", device, cudaGetErrorString(select_rc));
+        return 1;
+    }
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
         fprintf(stderr, "no CUDA device %d\n", device); return 1;
@@ -174,6 +193,7 @@ int main(int argc, char **argv) {
     }
 
     uint64_t graphs = 0, cycles = 0, shares = 0, bugs = 0;
+    int exit_code = 0;
     double t0 = 0.0;
     std::vector<SolverCtx*> extra_contexts;
 
@@ -212,7 +232,21 @@ int main(int argc, char **argv) {
         }
     };
 
+    auto observe_trim = [&](tari_miner::SolverWatchdog &watchdog,
+                            int context,
+                            const SolverTrimResult &trim) {
+        if (watchdog.observe(trim.nedges, trim.cuda_error == cudaSuccess))
+            return true;
+        if (trim.cuda_error != cudaSuccess)
+            report_cuda_failure(device, context, "trim", trim.cuda_error);
+        else
+            report_zero_yield_failure(device, context);
+        exit_code = tari_miner::SOLVER_FAILURE_EXIT_CODE;
+        return false;
+    };
+
     if (pipeline <= 1) {
+      tari_miner::SolverWatchdog watchdog;
       t0 = now_sec();
       for (uint64_t r = 0; r < count; r++) {
         uint64_t nonce = start_nonce + r;
@@ -220,10 +254,19 @@ int main(int argc, char **argv) {
         // (1) Tari key derivation -> inject straight into the GPU trimmer.
         inject_keys(ctx, nonce);
 
-        int nsols = ctx->solve();             // GPU trim + cycle-find
-        graphs++;
-
-        (void)nsols;
+        SolverTrimResult trim = ctx->trim_copy_checked(device);
+        if (trim.cuda_error == cudaSuccess)
+            graphs++;
+        if (!observe_trim(watchdog, 0, trim))
+            break;
+        if (trim.nedges) {
+            int cycle_rc = ctx->findcycles_copied_status(trim.nedges);
+            if (cycle_rc != cudaSuccess) {
+                report_cuda_failure(device, 0, "cycle recovery", (cudaError_t)cycle_rc);
+                exit_code = tari_miner::SOLVER_FAILURE_EXIT_CODE;
+                break;
+            }
+        }
         consume_solutions(ctx, nonce);
       }
     } else {
@@ -247,6 +290,7 @@ int main(int argc, char **argv) {
         }
         pipeline = (int)contexts.size();
         printf("solver pipeline=%d context%s\n", pipeline, pipeline == 1 ? "" : "s");
+        std::vector<tari_miner::SolverWatchdog> watchdogs((size_t)pipeline);
         for (size_t i = 1; i < contexts.size(); i++)
             extra_contexts.push_back(contexts[i]);
         t0 = now_sec();
@@ -259,16 +303,18 @@ int main(int argc, char **argv) {
         std::vector<HostEdgeBuffer> edge_buffers((size_t)pipeline * 2);
         for (HostEdgeBuffer &b : edge_buffers) {
             const size_t edgeBytes = sizeof(uint2) * (size_t)MAXEDGES;
-            if (cudaMallocHost((void **)&b.ptr, edgeBytes) == cudaSuccess) {
+            cudaError_t pin_rc = cudaMallocHost((void **)&b.ptr, edgeBytes);
+            if (pin_rc == cudaSuccess) {
                 b.pinned = true;
             } else {
+                cudaGetLastError();
                 b.ptr = new uint2[edgeBytes / sizeof(uint2)];
                 b.pinned = false;
             }
         }
 
         struct PendingTrim {
-            std::future<u32> future;
+            std::future<SolverTrimResult> future;
             uint64_t nonce = 0;
             siphash_keys keys;
             uint2 *edges = nullptr;
@@ -298,10 +344,18 @@ int main(int argc, char **argv) {
             pending[(size_t)slot].keys = set_keys(c, nonce);
             pending[(size_t)slot].edges = out;
             pending[(size_t)slot].active = true;
-            pending[(size_t)slot].future = std::async(std::launch::async, [c, out, device]() -> u32 {
-                cudaSetDevice(device);
-                return c->trim_copy_to(out);
+            pending[(size_t)slot].future = std::async(std::launch::async, [c, out, device]() {
+                return c->trim_copy_to_checked(out, device);
             });
+        };
+
+        auto drain_pending = [&]() {
+            for (PendingTrim &item : pending) {
+                if (item.active) {
+                    item.future.get();
+                    item.active = false;
+                }
+            }
         };
 
         int initial = (count < (uint64_t)pipeline) ? (int)count : pipeline;
@@ -310,22 +364,32 @@ int main(int argc, char **argv) {
         for (uint64_t done = 0; done < count; done++) {
             int slot = (int)(done % (uint64_t)pipeline);
             SolverCtx *c = contexts[(size_t)slot];
-            u32 nedges = pending[(size_t)slot].future.get();
+            SolverTrimResult trim = pending[(size_t)slot].future.get();
             uint64_t nonce = pending[(size_t)slot].nonce;
             siphash_keys keys = pending[(size_t)slot].keys;
             uint2 *edgeBuf = pending[(size_t)slot].edges;
             pending[(size_t)slot].active = false;
 
-            if (next < count)
-                launch_trim(slot);
+            if (trim.cuda_error == cudaSuccess)
+                graphs++;
+            if (!observe_trim(watchdogs[(size_t)slot], slot, trim))
+                break;
 
             c->sols.clear();
-            if (nedges)
-                c->findcycles_with_keys(edgeBuf, nedges, keys, c->sols);
-            graphs++;
+            if (trim.nedges) {
+                int cycle_rc = c->findcycles_with_keys(edgeBuf, trim.nedges, keys, c->sols);
+                if (cycle_rc != cudaSuccess) {
+                    report_cuda_failure(device, slot, "cycle recovery", (cudaError_t)cycle_rc);
+                    exit_code = tari_miner::SOLVER_FAILURE_EXIT_CODE;
+                    break;
+                }
+            }
             consume_solutions(c, nonce);
+            if (next < count)
+                launch_trim(slot);
         }
 
+        drain_pending();
         for (HostEdgeBuffer &b : edge_buffers) {
             if (b.pinned)
                 cudaFreeHost(b.ptr);
@@ -334,7 +398,7 @@ int main(int argc, char **argv) {
         }
 #else
         struct PendingTrim {
-            std::future<u32> future;
+            std::future<SolverTrimResult> future;
             uint64_t nonce = 0;
             bool active = false;
         };
@@ -346,10 +410,18 @@ int main(int argc, char **argv) {
             inject_keys(c, nonce);
             pending[(size_t)slot].nonce = nonce;
             pending[(size_t)slot].active = true;
-            pending[(size_t)slot].future = std::async(std::launch::async, [c, device]() -> u32 {
-                cudaSetDevice(device);
-                return c->trim_copy();
+            pending[(size_t)slot].future = std::async(std::launch::async, [c, device]() {
+                return c->trim_copy_checked(device);
             });
+        };
+
+        auto drain_pending = [&]() {
+            for (PendingTrim &item : pending) {
+                if (item.active) {
+                    item.future.get();
+                    item.active = false;
+                }
+            }
         };
 
         int initial = (count < (uint64_t)pipeline) ? (int)count : pipeline;
@@ -358,15 +430,26 @@ int main(int argc, char **argv) {
         for (uint64_t done = 0; done < count; done++) {
             int slot = (int)(done % (uint64_t)pipeline);
             SolverCtx *c = contexts[(size_t)slot];
-            u32 nedges = pending[(size_t)slot].future.get();
+            SolverTrimResult trim = pending[(size_t)slot].future.get();
             pending[(size_t)slot].active = false;
-            if (nedges)
-                c->findcycles_copied(nedges);
-            graphs++;
+
+            if (trim.cuda_error == cudaSuccess)
+                graphs++;
+            if (!observe_trim(watchdogs[(size_t)slot], slot, trim))
+                break;
+            if (trim.nedges) {
+                int cycle_rc = c->findcycles_copied_status(trim.nedges);
+                if (cycle_rc != cudaSuccess) {
+                    report_cuda_failure(device, slot, "cycle recovery", (cudaError_t)cycle_rc);
+                    exit_code = tari_miner::SOLVER_FAILURE_EXIT_CODE;
+                    break;
+                }
+            }
             consume_solutions(c, pending[(size_t)slot].nonce);
             if (next < count)
                 launch_trim(slot);
         }
+        drain_pending();
 #endif
     }
 
@@ -382,5 +465,7 @@ int main(int argc, char **argv) {
     for (SolverCtx *extra : extra_contexts)
         destroy_solver_ctx(extra);
     destroy_solver_ctx(ctx);
+    if (exit_code)
+        return exit_code;
     return bugs ? 3 : 0;
 }

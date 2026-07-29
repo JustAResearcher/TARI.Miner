@@ -108,6 +108,12 @@ const u32 ROW_EDGES_B = EDGES_B * NY;
 #ifndef PINNED_EDGE_HOST
 #define PINNED_EDGE_HOST 1
 #endif
+#ifndef TARI_TEST_FORCE_ZERO_YIELD
+#define TARI_TEST_FORCE_ZERO_YIELD 0
+#endif
+#ifndef TARI_TEST_FORCE_CUDA_ERROR
+#define TARI_TEST_FORCE_CUDA_ERROR 0
+#endif
 
 #ifndef RECOVERY_SMALL_OUTPUT
 #define RECOVERY_SMALL_OUTPUT 0
@@ -802,9 +808,10 @@ struct edgetrimmer {
   u8 *bufferB = nullptr;
   u8 *bufferAB = nullptr;
   u32 *indexesE[1+NB] = {};
-  u32 nedges;
+  u32 nedges = 0;
+  cudaError_t trim_error = cudaSuccess;
   siphash_keys sipkeys;
-  bool abort;
+  bool abort = false;
   bool initsuccess = false;
 
   edgetrimmer(const trimparams _tp) : tp(_tp) {
@@ -825,7 +832,7 @@ struct edgetrimmer {
                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
                                            ROUND0_DST_HASH_DYNAMIC_WORDS * sizeof(u32)));
 #endif
-    cudaMemcpy(dt, this, sizeof(edgetrimmer), cudaMemcpyHostToDevice);
+    checkCudaErrors_V(cudaMemcpy(dt, this, sizeof(edgetrimmer), cudaMemcpyHostToDevice));
     initsuccess = true;
   }
   u64 globalbytes() const {
@@ -842,6 +849,8 @@ struct edgetrimmer {
       checkCudaErrors_V(cudaFree(dt));
   }
   u32 trim() {
+    nedges = 0;
+    trim_error = cudaSuccess;
     u32 qA = 0;
     u32 qE = 0;
 #if TRIM_STAGE_TIMING
@@ -972,7 +981,8 @@ struct edgetrimmer {
 
 #if FUSE_FINAL_TAIL_CURRENT
     TARI_TIMING_BEGIN();
-    cudaMemcpy(&nedges, indexesE[0], sizeof(u32), cudaMemcpyDeviceToHost);
+    trim_error =
+        cudaMemcpy(&nedges, indexesE[0], sizeof(u32), cudaMemcpyDeviceToHost);
     TARI_TIMING_END(timingTail);
 #else
     TARI_TIMING_BEGIN();
@@ -981,7 +991,8 @@ struct edgetrimmer {
     cudaDeviceSynchronize();
 #endif
     Tail<EDGES_B/4><<<tp.tail.blocks, tp.tail.tpb>>>((const uint2 *)bufferA, (uint2 *)bufferB, indexesE[0], indexesE[1]);
-    cudaMemcpy(&nedges, indexesE[1], sizeof(u32), cudaMemcpyDeviceToHost);
+    trim_error =
+        cudaMemcpy(&nedges, indexesE[1], sizeof(u32), cudaMemcpyDeviceToHost);
     TARI_TIMING_END(timingTail);
 #endif
 #if !SQUASH_OUTPUT
@@ -996,8 +1007,13 @@ struct edgetrimmer {
 #endif
 #undef TARI_TIMING_BEGIN
 #undef TARI_TIMING_END
-    return nedges;
+    return trim_error == cudaSuccess ? nedges : 0;
   }
+};
+
+struct SolverTrimResult {
+  u32 nedges = 0;
+  cudaError_t cuda_error = cudaSuccess;
 };
 
 struct solver_ctx {
@@ -1015,11 +1031,18 @@ struct solver_ctx {
   solver_ctx(const trimparams tp, bool mutate_nonce) : trimmer(tp), cg(MAXEDGES, MAXEDGES, MAXSOLS, IDXSHIFT) {
     pinned_edges = false;
 #if PINNED_EDGE_HOST
-    if (cudaMallocHost((void **)&edges, sizeof(uint2) * (size_t)MAXEDGES) == cudaSuccess)
+    cudaError_t pin_rc = cudaMallocHost((void **)&edges, sizeof(uint2) * (size_t)MAXEDGES);
+    if (pin_rc == cudaSuccess) {
       pinned_edges = true;
-    else
-#endif
+    } else {
+      // Pageable memory is an intentional fallback, so do not let the handled
+      // allocation error poison the first per-trim CUDA health check.
+      cudaGetLastError();
       edges = new uint2[MAXEDGES];
+    }
+#else
+    edges = new uint2[MAXEDGES];
+#endif
 #if RECOVERY_SMALL_OUTPUT
     recoverIndexes = nullptr;
     checkCudaErrors_V(cudaMalloc((void **)&recoverIndexes, PROOFSIZE * sizeof(u32)));
@@ -1055,17 +1078,23 @@ struct solver_ctx {
       }
       // print_log("\n");
       outSols.resize(outSols.size() + PROOFSIZE);
-      cudaMemcpyToSymbol(recoveredges, soledges, sizeof(soledges));
+      checkCudaErrors(cudaMemcpyToSymbol(recoveredges, soledges, sizeof(soledges)));
 #if RECOVERY_SMALL_OUTPUT
-      cudaMemset(recoverIndexes, 0, PROOFSIZE * sizeof(u32));
+      checkCudaErrors(cudaMemset(recoverIndexes, 0, PROOFSIZE * sizeof(u32)));
       Recovery<<<trimmer.tp.recover.blocks, trimmer.tp.recover.tpb>>>(keys, (ulonglong4*)trimmer.bufferA, (int *)recoverIndexes);
-      cudaMemcpy(&outSols[outSols.size()-PROOFSIZE], recoverIndexes, PROOFSIZE * sizeof(u32), cudaMemcpyDeviceToHost);
+      checkCudaErrors(cudaGetLastError());
+      checkCudaErrors(cudaMemcpy(&outSols[outSols.size()-PROOFSIZE], recoverIndexes,
+                                 PROOFSIZE * sizeof(u32), cudaMemcpyDeviceToHost));
 #else
-      cudaMemset(trimmer.indexesE[1], 0, trimmer.indexesSize);
+      checkCudaErrors(cudaMemset(trimmer.indexesE[1], 0, trimmer.indexesSize));
       Recovery<<<trimmer.tp.recover.blocks, trimmer.tp.recover.tpb>>>(keys, (ulonglong4*)trimmer.bufferA, (int *)trimmer.indexesE[1]);
-      cudaMemcpy(&outSols[outSols.size()-PROOFSIZE], trimmer.indexesE[1], PROOFSIZE * sizeof(u32), cudaMemcpyDeviceToHost);
+      checkCudaErrors(cudaGetLastError());
+      checkCudaErrors(cudaMemcpy(&outSols[outSols.size()-PROOFSIZE], trimmer.indexesE[1],
+                                 PROOFSIZE * sizeof(u32), cudaMemcpyDeviceToHost));
 #endif
-      checkCudaErrors(cudaDeviceSynchronize());
+      // Recovery uses the calling thread's default stream. Synchronizing that
+      // stream preserves overlap with trims running in other host threads.
+      checkCudaErrors(cudaStreamSynchronize(0));
       qsort(&outSols[outSols.size()-PROOFSIZE], PROOFSIZE, sizeof(u32), cg.nonce_cmp);
     }
     return 0;
@@ -1085,7 +1114,8 @@ struct solver_ctx {
       return 0;
     time1 = timestamp(); timems  = (time1 - time0) / 1000000;
     time0 = timestamp();
-    findcycles_copied(nedges);
+    if (findcycles_copied_status(nedges) != cudaSuccess)
+      return 0;
     time1 = timestamp(); timems2 = (time1 - time0) / 1000000;
     print_log("findcycles edges %d time %d ms total %d ms\n", nedges, timems2, timems+timems2);
     return sols.size() / PROOFSIZE;
@@ -1095,14 +1125,21 @@ struct solver_ctx {
     return trim_copy_to(edges);
   }
 
-  u32 trim_copy_to(uint2 *outEdges) {
+  u32 trim_copy_to(uint2 *outEdges, cudaError_t *copy_error = nullptr) {
 #if TRIM_STAGE_TIMING
     cudaEvent_t copyStart, copyStop;
     checkCudaErrors(cudaEventCreate(&copyStart));
     checkCudaErrors(cudaEventCreate(&copyStop));
 #endif
+    if (copy_error)
+      *copy_error = cudaSuccess;
     trimmer.abort = false;
     u32 nedges = trimmer.trim();
+    if (trimmer.trim_error != cudaSuccess) {
+      if (copy_error)
+        *copy_error = trimmer.trim_error;
+      return 0;
+    }
     if (!nedges) {
 #if TRIM_STAGE_TIMING
       checkCudaErrors(cudaEventDestroy(copyStart));
@@ -1117,13 +1154,15 @@ struct solver_ctx {
 #if TRIM_STAGE_TIMING
     cudaEventRecord(copyStart, 0);
 #endif
-    cudaMemcpy(outEdges,
+    cudaError_t edge_copy_error = cudaMemcpy(outEdges,
 #if FUSE_FINAL_TAIL_CURRENT
                trimmer.bufferA,
 #else
                trimmer.bufferB,
 #endif
                sizeof(uint2) * (size_t)nedges, cudaMemcpyDeviceToHost); // [tari-c29 patch] VLA-sizeof -> explicit
+    if (copy_error)
+      *copy_error = edge_copy_error;
 #if TRIM_STAGE_TIMING
     cudaEventRecord(copyStop, 0);
     cudaEventSynchronize(copyStop);
@@ -1133,11 +1172,60 @@ struct solver_ctx {
     checkCudaErrors(cudaEventDestroy(copyStart));
     checkCudaErrors(cudaEventDestroy(copyStop));
 #endif
-    return nedges;
+    return edge_copy_error == cudaSuccess ? nedges : 0;
+  }
+
+  SolverTrimResult trim_copy_checked(int device) {
+    return trim_copy_to_checked(edges, device);
+  }
+
+  SolverTrimResult trim_copy_to_checked(uint2 *outEdges, int device) {
+    SolverTrimResult result;
+    cudaError_t rc = cudaSetDevice(device);
+    if (rc != cudaSuccess) {
+      result.cuda_error = rc;
+      return result;
+    }
+
+    // CUDA's last-error state belongs to the calling host thread. Inspect and
+    // clear it here, before this same thread launches the trim.
+    rc = cudaGetLastError();
+    if (rc != cudaSuccess) {
+      result.cuda_error = rc;
+      return result;
+    }
+
+    cudaError_t copy_rc = cudaSuccess;
+    result.nedges = trim_copy_to(outEdges, &copy_rc);
+
+    // All trim work uses the calling thread's default stream. The release
+    // build selects per-thread default streams, so this detects asynchronous
+    // execution failures without serializing other pipeline slots.
+    cudaError_t sync_rc = cudaStreamSynchronize(0);
+    cudaError_t last_rc = cudaGetLastError();
+    result.cuda_error = copy_rc != cudaSuccess
+        ? copy_rc
+        : (sync_rc != cudaSuccess ? sync_rc : last_rc);
+#if TARI_TEST_FORCE_ZERO_YIELD
+    result.nedges = 0;
+#endif
+#if TARI_TEST_FORCE_CUDA_ERROR
+    // Exercise the same fatal path with a real CUDA runtime error rather than
+    // assigning a synthetic status value. This hook is compiled out normally.
+    result.cuda_error = cudaMemset(nullptr, 0, 1);
+    if (result.cuda_error == cudaSuccess)
+      result.cuda_error = cudaErrorInvalidValue;
+#endif
+    return result;
+  }
+
+  int findcycles_copied_status(u32 nedges) {
+    return findcycles(edges, nedges);
   }
 
   int findcycles_copied(u32 nedges) {
-    findcycles(edges, nedges);
+    if (findcycles_copied_status(nedges) != cudaSuccess)
+      return 0;
     return sols.size() / PROOFSIZE;
   }
 

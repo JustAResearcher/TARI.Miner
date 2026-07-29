@@ -57,6 +57,62 @@ static void test_terminal_sanitizing() {
           "ordinary text is unchanged");
 }
 
+static void test_json_root_fields() {
+    std::puts("JSON root fields:");
+    uint64_t id = 0;
+    const std::string compact =
+        "{\"id\":4,\"result\":true,\"error\":null}";
+    check(tari_pool::json_root_uint(compact, "id", id) && id == 4,
+          "compact integer field is parsed");
+    check(tari_pool::json_root_literal(compact, "result", "true") &&
+              tari_pool::json_root_literal(compact, "error", "null"),
+          "compact literal fields are parsed");
+
+    const std::string spaced =
+        "{ \"id\" : 4, \"result\" : false, \"error\" : null }";
+    check(tari_pool::json_root_uint(spaced, "id", id) && id == 4,
+          "whitespace around an integer field is accepted");
+    check(tari_pool::json_root_literal(spaced, "result", "false") &&
+              tari_pool::json_root_literal(spaced, "error", "null"),
+          "whitespace around literal fields is accepted");
+
+    const std::string nested =
+        "{\"result\":{\"id\":99,\"error\":true},\"id\":7,\"error\":null}";
+    check(tari_pool::json_root_uint(nested, "id", id) && id == 7,
+          "nested fields cannot shadow a root integer");
+    check(tari_pool::json_root_literal(nested, "error", "null"),
+          "nested fields cannot shadow a root literal");
+    size_t nested_id_position = 0;
+    size_t result_position = 0;
+    check(tari_pool::json_find_root_value(
+              nested, "result", result_position) &&
+              tari_pool::json_find_value_from(
+                  nested, "id", nested_id_position, result_position) &&
+              nested.compare(nested_id_position, 2, "99") == 0,
+          "nested fields can be found from a structural value position");
+
+    const std::string quoted =
+        "{\"message\":\"\\\"id\\\":99, \\\"error\\\":true\","
+        "\"id\":8,\"error\":{\"message\":\"rejected\"}}";
+    size_t error_position = 0;
+    check(tari_pool::json_root_uint(quoted, "id", id) && id == 8,
+          "field-like text inside a string is ignored");
+    check(tari_pool::json_find_root_value(
+              quoted, "error", error_position) &&
+              !tari_pool::json_root_literal(quoted, "error", "null"),
+          "a non-null root error is detected");
+
+    id = 123;
+    check(!tari_pool::json_root_uint("{\"id\":-1}", "id", id) && id == 123,
+          "negative request IDs fail closed");
+    check(!tari_pool::json_root_uint(
+              "{\"id\":18446744073709551616}", "id", id) && id == 123,
+          "overflowing request IDs fail closed");
+    check(!tari_pool::json_root_literal(
+              "{\"result\":trueish}", "result", "true"),
+          "literal prefixes are rejected");
+}
+
 static void test_line_buffer() {
     std::puts("Pool line buffering:");
     tari_pool::LineBuffer buffer;
@@ -170,6 +226,7 @@ static void test_socket_state() {
 int main() {
     test_target_conversion();
     test_terminal_sanitizing();
+    test_json_root_fields();
     test_line_buffer();
     test_socket_state();
     std::printf("\n%s (%d failure%s)\n",
