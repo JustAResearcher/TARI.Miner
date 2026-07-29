@@ -1,4 +1,4 @@
-TARI.Miner C29 v1.1.3
+TARI.Miner C29 v1.1.4
 =====================
 
 Community Tari Cuckaroo29 CUDA miner. No developer fee.

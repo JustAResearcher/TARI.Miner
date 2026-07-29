@@ -1,4 +1,4 @@
-TARI.Miner C29 v1.1.3 - HiveOS
+TARI.Miner C29 v1.1.4 - HiveOS
 ================================
 
 Community Tari Cuckaroo29 CUDA miner. No developer fee.
@@ -11,7 +11,7 @@ HiveOS custom miner setup
 
    Miner name: tari-miner-hiveos
    Installation URL:
-   https://github.com/JustAResearcher/TARI.Miner/releases/download/v1.1.3/tari-miner-hiveos-1.1.3.tar.gz
+   https://github.com/JustAResearcher/TARI.Miner/releases/download/v1.1.4/tari-miner-hiveos-1.1.4.tar.gz
    Hash algorithm: cuckaroo29
    Wallet and worker template: %WAL%.%WORKER_NAME%
    Pool URL: stratum+tcp://taric29-ca.luckypool.io:3111
@@ -41,7 +41,7 @@ It does not change clocks, voltage, fans, or power limits.
 Manual reinstall on a rig
 -------------------------
 /hive/miners/custom/custom-get \
-  https://github.com/JustAResearcher/TARI.Miner/releases/download/v1.1.3/tari-miner-hiveos-1.1.3.tar.gz \
+  https://github.com/JustAResearcher/TARI.Miner/releases/download/v1.1.4/tari-miner-hiveos-1.1.4.tar.gz \
   -f
 
 Then reapply the Flight Sheet or run `miner restart`.
