@@ -459,6 +459,10 @@ struct Options {
     std::string wallet;
     std::string worker;
     std::string pass = "x";
+    // Character(s) joining wallet and worker in the stratum login. The default
+    // is "wallet.worker"; other pool deployments may expect "wallet/worker".
+    std::string login_separator = ".";
+    int intensity = 100;
     int device = 0;
     int pipeline = 2;
     bool pipeline_set = false;
@@ -490,6 +494,9 @@ static void usage() {
            "  --pool host:port        default taric29-ca.luckypool.io:3111\n"
            "  --worker name           default hostname\n"
            "  --pass x                default x\n"
+    "  --login-separator s     joins wallet and worker in the pool login, default \".\"\n"
+           "                          (use \"/\" for pools expecting wallet/worker)\n"
+           "  --intensity N           1-100 percent duty cycle, default 100 (no throttle)\n"
            "  --device N              default 0\n"
            "  --pipeline N            solver contexts to overlap GPU trim and CPU cycle search, default auto\n"
            "  --max-runtime-sec N     stop after N seconds (test helper)\n"
@@ -518,6 +525,8 @@ static bool parse_args(int argc, char **argv, Options &o) {
         else if (!strcmp(argv[i], "--wallet")) { char *v = need(argv[i]); if (!v) return false; o.wallet = v; }
         else if (!strcmp(argv[i], "--worker")) { char *v = need(argv[i]); if (!v) return false; o.worker = v; }
         else if (!strcmp(argv[i], "--pass")) { char *v = need(argv[i]); if (!v) return false; o.pass = v; }
+        else if (!strcmp(argv[i], "--login-separator")) { char *v = need(argv[i]); if (!v) return false; o.login_separator = v; }
+        else if (!strcmp(argv[i], "--intensity")) { char *v = need(argv[i]); if (!v) return false; o.intensity = atoi(v); }
         else if (!strcmp(argv[i], "--device")) { char *v = need(argv[i]); if (!v) return false; o.device = atoi(v); }
         else if (!strcmp(argv[i], "--pipeline")) { char *v = need(argv[i]); if (!v) return false; o.pipeline = atoi(v); o.pipeline_set = true; }
         else if (!strcmp(argv[i], "--max-runtime-sec")) { char *v = need(argv[i]); if (!v) return false; o.max_runtime_sec = atoi(v); }
@@ -541,12 +550,25 @@ static bool parse_args(int argc, char **argv, Options &o) {
         fprintf(stderr, "--wallet is required\n");
         return false;
     }
+    if (o.intensity < 1) o.intensity = 1;
+    if (o.intensity > 100) o.intensity = 100;
     if (o.pipeline < 1) o.pipeline = 1;
     if (o.pipeline > TARI_C29_MAX_PIPELINE) o.pipeline = TARI_C29_MAX_PIPELINE;
     return true;
 }
 
 int main(int argc, char **argv) {
+    // stdout is fully buffered when it is not a console, so redirected progress
+    // lines - including the periodic speed report - would sit unflushed for
+    // several kilobytes before reaching a log file, and would be lost entirely
+    // if the process were killed. Win32 treats _IOLBF as full buffering, so use
+    // unbuffered output there and line buffering on platforms that support it.
+#ifdef _WIN32
+    setvbuf(stdout, nullptr, _IONBF, 0);
+#else
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+#endif
+
     Options opt;
     if (!parse_args(argc, argv, opt)) {
         usage();
@@ -618,7 +640,7 @@ int main(int argc, char **argv) {
         double elapsed = now_sec() - start;
         if (opt.max_runtime_sec > 0 && elapsed >= opt.max_runtime_sec) break;
 
-        std::string login = opt.wallet + "." + opt.worker;
+        std::string login = opt.wallet + opt.login_separator + opt.worker;
         printf("connecting to %s as %s\n", opt.pool.c_str(), login.c_str());
 
         PoolClient pool;
@@ -687,6 +709,31 @@ int main(int argc, char **argv) {
             }
         };
 
+        // Duty-cycle throttle. Sleeps in proportion to the time worked since the
+        // previous call, so intensity 50 leaves the card idle roughly half the
+        // time and 100 never sleeps at all. Pipelined callers first wait for
+        // queued trims so the GPU is actually idle during this sleep.
+        double last_resume = now_sec();
+        auto throttle = [&]() {
+            if (opt.intensity >= 100) return;
+            double now = now_sec();
+            double worked = now - last_resume;
+            if (worked > 0.0) {
+                double idle = worked * (100.0 - opt.intensity) / opt.intensity;
+                double deadline = now + idle;
+                while (pool.alive()) {
+                    double remaining = deadline - now_sec();
+                    if (remaining <= 0.0) break;
+                    if (opt.max_runtime_sec > 0 && now_sec() - start >= opt.max_runtime_sec) break;
+                    Job latest = pool.current_job();
+                    if (latest.seq != 0 && latest.seq != last_seq) break;
+                    std::this_thread::sleep_for(
+                        std::chrono::duration<double>(std::min(remaining, 0.1)));
+                }
+            }
+            last_resume = now_sec();
+        };
+
         if (opt.pipeline <= 1) while (pool.alive()) {
             elapsed = now_sec() - start;
             if (opt.max_runtime_sec > 0 && elapsed >= opt.max_runtime_sec) break;
@@ -710,6 +757,7 @@ int main(int argc, char **argv) {
             (void)nsols;
             consume_solutions(ctx, job, nonce);
             report_speed();
+            throttle();
         } else {
 #if SOLVER_PRELAUNCH_NEXT
             struct HostEdgeBuffer {
@@ -776,6 +824,14 @@ int main(int argc, char **argv) {
                 }
             };
 
+            auto wait_pending = [&]() {
+                if (opt.intensity >= 100) return;
+                for (int slot = 0; slot < opt.pipeline; ++slot) {
+                    if (pending[(size_t)slot].active)
+                        pending[(size_t)slot].future.wait();
+                }
+            };
+
             for (int slot = 0; slot < opt.pipeline; ++slot) {
                 if (!launch_trim(slot)) break;
             }
@@ -809,6 +865,8 @@ int main(int argc, char **argv) {
                 consume_solutions(slot_ctx, sol_job, nonce);
                 done++;
                 report_speed();
+                wait_pending();
+                throttle();
             }
             drain_pending();
             for (HostEdgeBuffer &b : edge_buffers) {
@@ -860,6 +918,14 @@ int main(int argc, char **argv) {
                 }
             };
 
+            auto wait_pending = [&]() {
+                if (opt.intensity >= 100) return;
+                for (int slot = 0; slot < opt.pipeline; ++slot) {
+                    if (pending[(size_t)slot].active)
+                        pending[(size_t)slot].future.wait();
+                }
+            };
+
             for (int slot = 0; slot < opt.pipeline; ++slot) {
                 if (!launch_trim(slot)) break;
             }
@@ -886,6 +952,8 @@ int main(int argc, char **argv) {
                 done++;
                 launch_trim(slot);
                 report_speed();
+                wait_pending();
+                throttle();
             }
             drain_pending();
 #endif

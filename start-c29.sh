@@ -7,6 +7,7 @@ TARI_WORKER="${TARI_WORKER:-$(hostname)}"
 TARI_DEVICES="${TARI_DEVICES:-all}"
 TARI_NVIDIA_SMI="${TARI_NVIDIA_SMI:-nvidia-smi}"
 TARI_LOG_DIR="${TARI_LOG_DIR:-}"
+TARI_LOGIN_SEPARATOR="${TARI_LOGIN_SEPARATOR:-}"
 MINER_ARGS=("$@")
 
 if [[ -z "${TARI_WALLET:-}" ]]; then
@@ -80,6 +81,9 @@ while IFS=',' read -r raw_index raw_cap raw_name; do
     gpu_worker="$TARI_WORKER-gpu$index"
     echo "GPU $index [$name] compute $cap -> $arch, worker $gpu_worker"
     command=("$backend" "${MINER_ARGS[@]}" --device "$index" --pool "$TARI_POOL" --wallet "$TARI_WALLET" --worker "$gpu_worker")
+    if [[ -n "$TARI_LOGIN_SEPARATOR" ]]; then
+        command+=(--login-separator "$TARI_LOGIN_SEPARATOR")
+    fi
     if [[ "${TARI_DRY_RUN:-0}" == "1" ]]; then
         printf '[DRY RUN]'
         printf ' %q' "${command[@]}"

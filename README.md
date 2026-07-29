@@ -31,7 +31,16 @@ The starter does not change GPU clocks, voltage, fans, or power limits.
 1. Extract `TARI.Miner-v1.1.2-windows.zip`.
 2. Run `start-c29.bat`.
 3. Paste your Tari wallet address when prompted.
-4. Leave each GPU miner window open while mining.
+4. Leave the starter window open while mining.
+
+`start-c29.bat` runs `start-c29.ps1`, which does the work. Both files must stay
+in the same folder. Windows PowerShell 5.1 is included with Windows, so nothing
+needs installing.
+
+Every GPU worker runs inside the starter's own window rather than a window of
+its own, and the starter stays open until the last worker has exited. Press
+Ctrl+C there to stop them all at once: workers share the starter's console so
+that a single interrupt reaches every one of them.
 
 The BAT file is preconfigured for `taric29-ca.luckypool.io:3111` and uses the
 Windows computer name as the base worker name. To save settings, edit the
@@ -41,6 +50,27 @@ To mine only on selected GPUs, set a comma-separated device list:
 
 ```bat
 set "TARI_DEVICES=0,2"
+start-c29.bat
+```
+
+To write per-GPU output to files instead of the console, set a log directory:
+
+```bat
+set "TARI_LOG_DIR=%CD%\logs"
+start-c29.bat
+```
+
+Each worker writes progress to `gpu0.log`, `gpu1.log`, and so on, including the
+periodic speed report. Warnings and connection errors go to `gpu0.err.log`
+alongside it. The two streams are separate files on Windows; the Linux starter
+combines them into one.
+
+Pools that expect `wallet/worker` rather than `wallet.worker` need the login
+separator set alongside the pool:
+
+```bat
+set "TARI_POOL=POOL_HOST:PORT"
+set "TARI_LOGIN_SEPARATOR=/"
 start-c29.bat
 ```
 
@@ -66,6 +96,7 @@ TARI_POOL=taric29-ca.luckypool.io:3111 \
 TARI_WORKER=RIG01 \
 TARI_WALLET=YOUR_TARI_WALLET \
 TARI_DEVICES=all \
+TARI_LOGIN_SEPARATOR=. \
 ./start-c29.sh
 ```
 
@@ -99,15 +130,55 @@ Options placed after the starter command are passed to every selected GPU:
 --wallet WALLET         Required Tari wallet address
 --worker NAME           Worker name
 --pass VALUE            Pool password; defaults to x
+--login-separator S     Joins wallet and worker in the pool login; defaults to .
+--intensity N           Duty cycle from 1 to 100 percent; defaults to 100
 --pipeline N            Overlapped solver contexts; defaults automatically
 --max-runtime-sec N     Stop after N seconds
 --version               Print version and exit
 ```
 
+### Intensity
+
+`--intensity` sets how much of the time the miner works. At 100, the default, it
+never pauses. At 50 it idles for about as long as it works, roughly halving both
+the graph rate and the load on the card. Lower values scale the same way, so 25
+works about a quarter of the time. Useful for sharing a GPU with something else,
+or for keeping a laptop cooler and quieter:
+
+```bash
+./start-c29.sh --intensity 50
+```
+
+```bat
+start-c29.bat --intensity 50
+```
+
+This is not the same as `--pipeline`. Pipeline depth controls how many solver
+contexts overlap, which is a memory and latency tuning knob, and lowering it to
+fit VRAM does not reduce how hard the GPU is driven. Intensity inserts idle time
+between graphs and is the setting to reach for when the goal is less load.
+
 The starter supplies `--device`, `--pool`, `--wallet`, and `--worker` after
 user options so each GPU always receives its detected device index and unique
 worker name. If automatic allocation does not fit in VRAM, retry with
 `--pipeline 1`.
+
+### Pool login format
+
+The login sent to the pool is the wallet address, the separator, then the
+worker name. LuckyPool expects `wallet.worker`, which is the default. Pools
+expecting `wallet/worker` need the separator changed:
+
+```bash
+TARI_WALLET=YOUR_TARI_WALLET \
+TARI_POOL=POOL_HOST:PORT \
+TARI_LOGIN_SEPARATOR=/ \
+./start-c29.sh
+```
+
+`TARI_LOGIN_SEPARATOR` sits alongside `TARI_POOL` because the two belong
+together: a pool defines both the endpoint and the login format it accepts.
+Passing `--login-separator` after the starter command works as well.
 
 The pool connection is plain TCP. Do not use a sensitive password for
 `--pass`; the default `x` is sufficient for LuckyPool.
