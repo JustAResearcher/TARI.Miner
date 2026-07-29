@@ -3,10 +3,10 @@
 //
 // What this DOES prove (no GPU, no network needed):
 //   * BLAKE2b-256 matches the official RFC test vectors.
-//   * Key derivation is deterministic and structured exactly as Tari specifies.
-//   * Proof pack/unpack is a clean round-trip and is exactly 153 bytes.
+//   * Key derivation matches a fixed Tari-compatible known-answer vector.
+//   * Proof packing is exactly 153 bytes and matches a fixed PoW hash vector.
 //   * The U256 difficulty division matches hand-computed reference values.
-//   * The 42-cycle verifier accepts a real synthetic cycle and rejects tampering.
+//   * The 42-cycle verifier rejects malformed and structurally invalid proofs.
 //
 // What this does NOT prove:
 //   * That a live pool still accepts the current wire protocol. That is covered
@@ -60,6 +60,11 @@ static void test_keys() {
     tari_c29_derive_keys(0x0102030405060708ULL, mh, &a);
     tari_c29_derive_keys(0x0102030405060708ULL, mh, &b);
     check(memcmp(&a, &b, sizeof a) == 0, "deterministic for same (nonce, mining_hash)");
+    check(a.k0 == 0x390be8d856a4eb02ULL &&
+          a.k1 == 0x528cf10de1e4c200ULL &&
+          a.k2 == 0x8c09d6c0a07a0425ULL &&
+          a.k3 == 0x3c59c73ceec687a6ULL,
+          "key lanes match Tari consensus vector");
 
     tari_siphash_keys c;
     tari_c29_derive_keys(0x0102030405060709ULL, mh, &c);  // nonce+1
@@ -72,15 +77,33 @@ static void test_keys() {
            (unsigned long long)a.k2, (unsigned long long)a.k3);
 }
 
-// ---- 3. pack / unpack round-trip -------------------------------------------
+// ---- 3. edge construction --------------------------------------------------
+static void test_edges() {
+    printf("Edge construction vectors:\n");
+    const tari_siphash_keys keys_a = {1, 2, 3, 4};
+    uint32_t u, v;
+
+    tari_c29_edge(&keys_a, 10, &u, &v);
+    check(u == 0x07c05d0cU && v == 0x1067e24cU,
+          "keys={1,2,3,4}, edge=10");
+
+    tari_c29_edge(&keys_a, 123, &u, &v);
+    check(u == 0x19ef91fdU && v == 0x1cdeb9a6U,
+          "keys={1,2,3,4}, edge=123");
+
+    const tari_siphash_keys keys_b = {9, 7, 6, 7};
+    tari_c29_edge(&keys_b, 12, &u, &v);
+    check(u == 0x1ce55116U && v == 0x03cf0b9bU,
+          "keys={9,7,6,7}, edge=12");
+}
+
+// ---- 4. pack / unpack round-trip -------------------------------------------
 static void test_pack() {
     printf("Proof packing:\n");
     uint32_t nonces[42], back[42];
-    // ascending, < 2^29, spanning the full range and the high bits
-    uint32_t v = 7;
-    for (int i = 0; i < 42; i++) { nonces[i] = v & ((1u<<29)-1); v += 12345671u; }
-    // force strictly ascending & in-range
-    for (int i = 0; i < 42; i++) nonces[i] = (uint32_t)(((uint64_t)i * 0x1FFFFFFFull) / 42);
+    // Ascending, < 2^29, and spanning the full range and high bits.
+    for (int i = 0; i < 42; i++)
+        nonces[i] = (uint32_t)(((uint64_t)i * 0x1FFFFFFFULL) / 42 + (uint64_t)i);
 
     uint8_t packed[TARI_C29_PACKED_BYTES];
     tari_c29_pack(nonces, packed);
@@ -90,9 +113,17 @@ static void test_pack() {
 
     // top 6 bits of the final byte must be zero (42*29 = 1218 bits -> 2 bits in byte 152)
     check((packed[152] & 0xFC) == 0, "trailing pad bits are zero");
+
+    uint8_t digest[32];
+    char digest_hex[65];
+    blake2b(digest, sizeof digest, packed, sizeof packed, NULL, 0);
+    hex(digest, sizeof digest, digest_hex);
+    check(strcmp(digest_hex,
+                 "ee5be40a32a8a0815edc7d2f3cdef8193f01a3a75ef614c368375b411fc059e1") == 0,
+          "packed proof BLAKE2b-256 matches Tari consensus vector");
 }
 
-// ---- 4. U256 difficulty math ----------------------------------------------
+// ---- 5. U256 difficulty math ----------------------------------------------
 static void be_hash_from_scalar(uint8_t hash[32], const uint64_t w[4]) {
     // w[3] most significant limb -> hash[0..8]
     for (int limb = 0; limb < 4; limb++) {
@@ -134,7 +165,7 @@ static void test_difficulty() {
            (unsigned long long)tari_c29_difficulty(packed));
 }
 
-// ---- 5. 42-cycle verifier: find a real cycle, then verify & tamper ---------
+// ---- 6. 42-cycle verifier: find a real cycle, then verify & tamper ---------
 // We brute-force a small graph by lowering the effective edge space via a
 // fixed mining_hash/nonce and scanning, building the union-find the way a
 // solver would. To keep the self-test fast and deterministic we instead
@@ -172,6 +203,7 @@ int main() {
     printf("=== Tari C29 wrapper self-test ===\n\n");
     test_blake2b();
     test_keys();
+    test_edges();
     test_pack();
     test_difficulty();
     test_verify_guards();

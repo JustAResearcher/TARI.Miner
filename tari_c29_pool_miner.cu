@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <future>
 
+#include "tari_miner_reliability.h"
 #include "tari_pool_protocol.h"
 
 #if defined(_WIN32)
@@ -73,6 +74,20 @@ static const socket_t INVALID_SOCK = -1;
 
 #include "tari_c29.h"
 #include "version.h"
+
+static void report_cuda_failure(int device, int context, const char *phase, cudaError_t error) {
+    fprintf(stderr,
+            "fatal: CUDA %s failure on device %d solver context %d: %s (%s); "
+            "exiting for supervisor restart\n",
+            phase, device, context, cudaGetErrorName(error), cudaGetErrorString(error));
+}
+
+static void report_zero_yield_failure(int device, int context) {
+    fprintf(stderr,
+            "fatal: device %d solver context %d returned zero surviving edges for "
+            "%u consecutive graphs; exiting for supervisor restart\n",
+            device, context, tari_miner::MAX_CONSECUTIVE_ZERO_YIELDS);
+}
 
 static double now_sec() {
     using namespace std::chrono;
@@ -198,10 +213,12 @@ static std::string hex_bytes(const uint8_t *p, size_t n) {
 }
 
 static bool json_get_string_from(const std::string &line, const char *key, std::string &out, size_t start = 0) {
-    std::string pat = std::string("\"") + key + "\":\"";
-    size_t p = line.find(pat, start);
-    if (p == std::string::npos) return false;
-    p += pat.size();
+    size_t p = 0;
+    if (!tari_pool::json_find_value_from(line, key, p, start) ||
+        p == line.size() || line[p] != '"') {
+        return false;
+    }
+    p++;
     std::string val;
     bool esc = false;
     for (; p < line.size(); ++p) {
@@ -222,10 +239,9 @@ static bool json_get_string_from(const std::string &line, const char *key, std::
 }
 
 static bool json_get_uint_from(const std::string &line, const char *key, uint64_t &out, size_t start = 0) {
-    std::string pat = std::string("\"") + key + "\":";
-    size_t p = line.find(pat, start);
-    if (p == std::string::npos) return false;
-    p += pat.size();
+    size_t p = 0;
+    if (!tari_pool::json_find_value_from(line, key, p, start))
+        return false;
     char *end = nullptr;
     out = strtoull(line.c_str() + p, &end, 10);
     return end && end != line.c_str() + p;
@@ -277,9 +293,11 @@ static bool parse_job_line(
     bool *invalid_target
 ) {
     *invalid_target = false;
-    size_t start = line.find("\"job\":");
-    if (start == std::string::npos) start = line.find("\"params\":");
-    if (start == std::string::npos) return false;
+    size_t start = 0;
+    if (!tari_pool::json_find_value_from(line, "job", start) &&
+        !tari_pool::json_find_value_from(line, "params", start)) {
+        return false;
+    }
 
     Job j = current;
     std::string blob, job_id, target, xn;
@@ -367,18 +385,21 @@ public:
 
     bool submit_share(const Job &job, uint64_t nonce, const uint32_t edges[TARI_C29_PROOFSIZE]) {
         std::string id;
+        uint64_t request_id;
         {
             std::lock_guard<std::mutex> lk(mu_);
             id = login_id_;
+            if (id.empty()) return false;
+            request_id = responses_.begin_submit();
         }
-        if (id.empty()) return false;
 
         uint8_t packed[TARI_C29_PACKED_BYTES];
         uint8_t result[32];
         tari_c29_pack(edges, packed);
         blake2b(result, 32, packed, TARI_C29_PACKED_BYTES, nullptr, 0);
 
-        std::string req = "{\"id\":4,\"jsonrpc\":\"2.0\",\"method\":\"submit\",\"params\":{\"id\":\"" +
+        std::string req = "{\"id\":" + std::to_string(request_id) +
+            ",\"jsonrpc\":\"2.0\",\"method\":\"submit\",\"params\":{\"id\":\"" +
             json_escape(id) + "\",\"job_id\":\"" + json_escape(job.job_id) + "\",\"nonce\":\"" +
             nonce_hex_be(nonce) + "\",\"pow\":[";
         for (int i = 0; i < TARI_C29_PROOFSIZE; ++i) {
@@ -388,11 +409,17 @@ public:
             req += buf;
         }
         req += "],\"result\":\"" + hex_bytes(result, sizeof(result)) + "\"}}\n";
-        return send_line(req);
+        if (send_line(req)) return true;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            responses_.cancel_submit(request_id);
+        }
+        return false;
     }
 
     uint64_t accepted() const { return accepted_.load(); }
     uint64_t rejected() const { return rejected_.load(); }
+    bool login_failed() const { return login_failed_.load(); }
 
 private:
     bool send_line(const std::string &line) {
@@ -421,22 +448,64 @@ private:
     }
 
     void handle_line(const std::string &line) {
-        if (line.find("\"result\":true") != std::string::npos) {
+        uint64_t response_id = 0;
+        bool has_id = tari_pool::json_root_uint(line, "id", response_id);
+        size_t error_position = 0;
+        bool has_error_field =
+            tari_pool::json_find_root_value(line, "error", error_position);
+        bool has_error =
+            has_error_field && !tari_pool::json_root_literal(line, "error", "null");
+        size_t result_position = 0;
+        bool has_result =
+            tari_pool::json_find_root_value(line, "result", result_position);
+        bool result_true = tari_pool::json_root_literal(line, "result", "true");
+        bool result_false = tari_pool::json_root_literal(line, "result", "false");
+        tari_miner::PoolResponseKind response;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            bool login_pending = login_id_.empty() && job_.seq == 0;
+            response = responses_.classify(
+                has_id, response_id, has_error, has_result,
+                result_true, result_false,
+                login_pending
+            );
+        }
+
+        if (response == tari_miner::PoolResponseKind::LoginError) {
+            std::string message;
+            if (!json_get_string_from(line, "message", message) &&
+                !json_get_string_from(line, "error", message)) {
+                message = "pool rejected the login";
+            }
+            std::string safe = tari_pool::sanitize_for_terminal(message);
+            fprintf(stderr, "pool login rejected: %s\n", safe.c_str());
+            login_failed_.store(true);
+            running_.store(false);
+            shutdown_socket(socket_.load());
+            return;
+        }
+        if (response == tari_miner::PoolResponseKind::ShareAccepted) {
             accepted_.fetch_add(1);
             printf("share accepted (%llu total)\n", (unsigned long long)accepted_.load());
             return;
         }
-        if (line.find("\"error\"") != std::string::npos && line.find("\"error\":null") == std::string::npos) {
+        if (response == tari_miner::PoolResponseKind::ShareRejected) {
             rejected_.fetch_add(1);
             std::string safe = tari_pool::sanitize_for_terminal(line);
-            printf("pool error/reject: %s\n", safe.c_str());
+            printf("share rejected: %s\n", safe.c_str());
+            return;
+        }
+        if (response == tari_miner::PoolResponseKind::OtherError) {
+            std::string safe = tari_pool::sanitize_for_terminal(line);
+            printf("pool error: %s\n", safe.c_str());
             return;
         }
 
         std::lock_guard<std::mutex> lk(mu_);
-        size_t result_pos = line.find("\"result\":");
+        size_t result_pos = 0;
         std::string id;
-        if (result_pos != std::string::npos && json_get_string_from(line, "id", id, result_pos)) {
+        if (tari_pool::json_find_root_value(line, "result", result_pos) &&
+            json_get_string_from(line, "id", id, result_pos)) {
             login_id_ = id;
         }
 
@@ -461,7 +530,9 @@ private:
     mutable std::mutex mu_;
     Job job_;
     std::string login_id_;
+    tari_miner::PoolResponseTracker responses_;
     std::atomic<bool> running_{false};
+    std::atomic<bool> login_failed_{false};
     std::atomic<uint64_t> accepted_{0};
     std::atomic<uint64_t> rejected_{0};
 };
@@ -562,6 +633,12 @@ static bool parse_args(int argc, char **argv, Options &o) {
         fprintf(stderr, "--wallet is required\n");
         return false;
     }
+    tari_miner::WalletValidationError wallet_error =
+        tari_miner::validate_wallet(o.wallet);
+    if (wallet_error == tari_miner::WalletValidationError::WhitespaceOrControl) {
+        fprintf(stderr, "--wallet must not contain whitespace or control characters\n");
+        return false;
+    }
     if (o.intensity < 1) o.intensity = 1;
     if (o.intensity > 100) o.intensity = 100;
     if (o.pipeline < 1) o.pipeline = 1;
@@ -591,7 +668,13 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    cudaSetDevice(opt.device);
+    cudaError_t select_rc = cudaSetDevice(opt.device);
+    if (select_rc != cudaSuccess) {
+        fprintf(stderr, "no CUDA device %d: %s\n",
+                opt.device, cudaGetErrorString(select_rc));
+        socket_cleanup();
+        return 1;
+    }
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, opt.device) != cudaSuccess) {
         fprintf(stderr, "no CUDA device %d\n", opt.device);
@@ -645,8 +728,23 @@ int main(int argc, char **argv) {
     printf("solver pipeline=%d context%s\n", opt.pipeline, opt.pipeline == 1 ? "" : "s");
 
     uint64_t graphs = 0, cycles = 0, submitted = 0, verify_failures = 0;
+    int exit_code = 0;
+    tari_miner::LoginFailurePolicy login_failures;
+    std::vector<tari_miner::SolverWatchdog> solver_watchdogs(contexts.size());
     double start = now_sec();
     double last_report = start;
+
+    auto observe_trim = [&](int context, const SolverTrimResult &trim) {
+        tari_miner::SolverWatchdog &watchdog = solver_watchdogs[(size_t)context];
+        if (watchdog.observe(trim.nedges, trim.cuda_error == cudaSuccess))
+            return true;
+        if (trim.cuda_error != cudaSuccess)
+            report_cuda_failure(opt.device, context, "trim", trim.cuda_error);
+        else
+            report_zero_yield_failure(opt.device, context);
+        exit_code = tari_miner::SOLVER_FAILURE_EXIT_CODE;
+        return false;
+    };
 
     while (true) {
         double elapsed = now_sec() - start;
@@ -664,9 +762,29 @@ int main(int argc, char **argv) {
 
         Job job;
         if (!pool.wait_for_job(job, 20000)) {
+            if (pool.login_failed()) {
+                pool.stop();
+                bool fatal = login_failures.record_failure();
+                if (fatal) {
+                    fprintf(stderr,
+                            "pool login rejected %u times; check the wallet address, "
+                            "worker name, password, and login separator\n",
+                            login_failures.consecutive_failures());
+                    exit_code = tari_miner::LOGIN_FAILURE_EXIT_CODE;
+                    break;
+                }
+                fprintf(stderr,
+                        "pool login rejected (%u/%u); retrying in 5s\n",
+                        login_failures.consecutive_failures(),
+                        tari_miner::MAX_LOGIN_FAILURES);
+                std::this_thread::sleep_for(
+                    std::chrono::seconds(tari_miner::LOGIN_RETRY_SECONDS));
+                continue;
+            }
             fprintf(stderr, "no job received; reconnecting\n");
             continue;
         }
+        login_failures.record_success();
 
         uint64_t last_seq = 0;
         uint64_t base = 0, mask = ~0ULL, counter = 0;
@@ -764,9 +882,21 @@ int main(int argc, char **argv) {
             uint64_t nonce = base | (counter++ & mask);
             inject_keys(ctx, nonce, job);
 
-            int nsols = ctx->solve();
-            graphs++;
-            (void)nsols;
+            SolverTrimResult trim = ctx->trim_copy_checked(opt.device);
+            if (trim.cuda_error == cudaSuccess)
+                graphs++;
+            if (!observe_trim(0, trim))
+                break;
+            if (trim.nedges) {
+                int cycle_rc = ctx->findcycles_copied_status(trim.nedges);
+                if (cycle_rc != cudaSuccess) {
+                    report_cuda_failure(
+                        opt.device, 0, "cycle recovery", (cudaError_t)cycle_rc
+                    );
+                    exit_code = tari_miner::SOLVER_FAILURE_EXIT_CODE;
+                    break;
+                }
+            }
             consume_solutions(ctx, job, nonce);
             report_speed();
             throttle();
@@ -778,14 +908,18 @@ int main(int argc, char **argv) {
             };
             std::vector<HostEdgeBuffer> edge_buffers((size_t)opt.pipeline * 2);
             for (HostEdgeBuffer &b : edge_buffers) {
-                if (cudaMallocHost((void **)&b.ptr, sizeof(uint2) * (size_t)MAXEDGES) == cudaSuccess)
+                cudaError_t pin_rc =
+                    cudaMallocHost((void **)&b.ptr, sizeof(uint2) * (size_t)MAXEDGES);
+                if (pin_rc == cudaSuccess) {
                     b.pinned = true;
-                else
+                } else {
+                    cudaGetLastError();
                     b.ptr = new uint2[MAXEDGES];
+                }
             }
 
             struct PendingTrim {
-                std::future<u32> future;
+                std::future<SolverTrimResult> future;
                 Job job;
                 uint64_t nonce = 0;
                 siphash_keys keys;
@@ -820,9 +954,8 @@ int main(int argc, char **argv) {
                 pending[(size_t)slot].keys = keys;
                 pending[(size_t)slot].edges = out;
                 pending[(size_t)slot].active = true;
-                pending[(size_t)slot].future = std::async(std::launch::async, [slot_ctx, out, device = opt.device]() -> u32 {
-                    cudaSetDevice(device);
-                    return slot_ctx->trim_copy_to(out);
+                pending[(size_t)slot].future = std::async(std::launch::async, [slot_ctx, out, device = opt.device]() {
+                    return slot_ctx->trim_copy_to_checked(out, device);
                 });
                 return true;
             };
@@ -830,8 +963,13 @@ int main(int argc, char **argv) {
             auto drain_pending = [&]() {
                 for (int slot = 0; slot < opt.pipeline; ++slot) {
                     if (pending[(size_t)slot].active) {
-                        pending[(size_t)slot].future.get();
+                        SolverTrimResult trim =
+                            pending[(size_t)slot].future.get();
                         pending[(size_t)slot].active = false;
+                        if (trim.cuda_error == cudaSuccess)
+                            graphs++;
+                        if (!exit_code)
+                            observe_trim(slot, trim);
                     }
                 }
             };
@@ -861,20 +999,33 @@ int main(int argc, char **argv) {
                 }
 
                 SolverCtx *slot_ctx = contexts[(size_t)slot];
-                u32 nedges = pending[(size_t)slot].future.get();
+                SolverTrimResult trim = pending[(size_t)slot].future.get();
                 Job sol_job = pending[(size_t)slot].job;
                 uint64_t nonce = pending[(size_t)slot].nonce;
                 siphash_keys keys = pending[(size_t)slot].keys;
                 uint2 *edge_buf = pending[(size_t)slot].edges;
                 pending[(size_t)slot].active = false;
 
-                launch_trim(slot);
+                if (trim.cuda_error == cudaSuccess)
+                    graphs++;
+                if (!observe_trim(slot, trim))
+                    break;
 
                 slot_ctx->sols.clear();
-                if (nedges)
-                    slot_ctx->findcycles_with_keys(edge_buf, nedges, keys, slot_ctx->sols);
-                graphs++;
+                if (trim.nedges) {
+                    int cycle_rc = slot_ctx->findcycles_with_keys(
+                        edge_buf, trim.nedges, keys, slot_ctx->sols
+                    );
+                    if (cycle_rc != cudaSuccess) {
+                        report_cuda_failure(
+                            opt.device, slot, "cycle recovery", (cudaError_t)cycle_rc
+                        );
+                        exit_code = tari_miner::SOLVER_FAILURE_EXIT_CODE;
+                        break;
+                    }
+                }
                 consume_solutions(slot_ctx, sol_job, nonce);
+                launch_trim(slot);
                 done++;
                 report_speed();
                 wait_pending();
@@ -889,7 +1040,7 @@ int main(int argc, char **argv) {
             }
 #else
             struct PendingTrim {
-                std::future<u32> future;
+                std::future<SolverTrimResult> future;
                 Job job;
                 uint64_t nonce = 0;
                 bool active = false;
@@ -914,9 +1065,8 @@ int main(int argc, char **argv) {
                 pending[(size_t)slot].job = launch_job;
                 pending[(size_t)slot].nonce = nonce;
                 pending[(size_t)slot].active = true;
-                pending[(size_t)slot].future = std::async(std::launch::async, [slot_ctx, device = opt.device]() -> u32 {
-                    cudaSetDevice(device);
-                    return slot_ctx->trim_copy();
+                pending[(size_t)slot].future = std::async(std::launch::async, [slot_ctx, device = opt.device]() {
+                    return slot_ctx->trim_copy_checked(device);
                 });
                 return true;
             };
@@ -924,8 +1074,13 @@ int main(int argc, char **argv) {
             auto drain_pending = [&]() {
                 for (int slot = 0; slot < opt.pipeline; ++slot) {
                     if (pending[(size_t)slot].active) {
-                        pending[(size_t)slot].future.get();
+                        SolverTrimResult trim =
+                            pending[(size_t)slot].future.get();
                         pending[(size_t)slot].active = false;
+                        if (trim.cuda_error == cudaSuccess)
+                            graphs++;
+                        if (!exit_code)
+                            observe_trim(slot, trim);
                     }
                 }
             };
@@ -955,11 +1110,22 @@ int main(int argc, char **argv) {
                 }
 
                 SolverCtx *slot_ctx = contexts[(size_t)slot];
-                u32 nedges = pending[(size_t)slot].future.get();
+                SolverTrimResult trim = pending[(size_t)slot].future.get();
                 pending[(size_t)slot].active = false;
-                if (nedges)
-                    slot_ctx->findcycles_copied(nedges);
-                graphs++;
+                if (trim.cuda_error == cudaSuccess)
+                    graphs++;
+                if (!observe_trim(slot, trim))
+                    break;
+                if (trim.nedges) {
+                    int cycle_rc = slot_ctx->findcycles_copied_status(trim.nedges);
+                    if (cycle_rc != cudaSuccess) {
+                        report_cuda_failure(
+                            opt.device, slot, "cycle recovery", (cudaError_t)cycle_rc
+                        );
+                        exit_code = tari_miner::SOLVER_FAILURE_EXIT_CODE;
+                        break;
+                    }
+                }
                 consume_solutions(slot_ctx, pending[(size_t)slot].job, pending[(size_t)slot].nonce);
                 done++;
                 launch_trim(slot);
@@ -970,6 +1136,8 @@ int main(int argc, char **argv) {
             drain_pending();
 #endif
         }
+        if (exit_code)
+            break;
     }
 
     double elapsed = now_sec() - start;
@@ -981,5 +1149,6 @@ int main(int argc, char **argv) {
     for (SolverCtx *c : contexts)
         destroy_solver_ctx(c);
     socket_cleanup();
+    if (exit_code) return exit_code;
     return verify_failures ? 3 : 0;
 }
