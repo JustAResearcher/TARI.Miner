@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <future>
 
+#include "tari_miner_pipeline.h"
 #include "tari_miner_reliability.h"
 #include "tari_pool_protocol.h"
 
@@ -62,18 +63,31 @@ static const socket_t INVALID_SOCK = -1;
 #endif
 
 #define SQUASH_OUTPUT 1
-#ifndef TARI_C29_MAX_PIPELINE
-#define TARI_C29_MAX_PIPELINE 5
-#endif
-#ifndef SOLVER_PRELAUNCH_NEXT
-#define SOLVER_PRELAUNCH_NEXT 0
-#endif
 #define main reference_mean_main_unused
 #include "mean_c29.cu"
 #undef main
 
 #include "tari_c29.h"
 #include "version.h"
+
+static tari_miner::DriverMode driver_mode(const cudaDeviceProp &prop) {
+#if defined(_WIN32)
+    return prop.tccDriver
+        ? tari_miner::DriverMode::WindowsTcc
+        : tari_miner::DriverMode::WindowsWddm;
+#else
+    (void)prop;
+    return tari_miner::DriverMode::Linux;
+#endif
+}
+
+static size_t solver_context_bytes(const SolverCtx *ctx) {
+    size_t bytes = ctx->trimmer.globalbytes();
+#if RECOVERY_SMALL_OUTPUT
+    bytes += PROOFSIZE * sizeof(u32);
+#endif
+    return bytes;
+}
 
 static void report_cuda_failure(int device, int context, const char *phase, cudaError_t error) {
     fprintf(stderr,
@@ -641,8 +655,8 @@ static bool parse_args(int argc, char **argv, Options &o) {
     }
     if (o.intensity < 1) o.intensity = 1;
     if (o.intensity > 100) o.intensity = 100;
-    if (o.pipeline < 1) o.pipeline = 1;
-    if (o.pipeline > TARI_C29_MAX_PIPELINE) o.pipeline = TARI_C29_MAX_PIPELINE;
+    if (o.pipeline_set)
+        o.pipeline = tari_miner::clamp_pipeline_depth(o.pipeline);
     return true;
 }
 
@@ -681,9 +695,6 @@ int main(int argc, char **argv) {
         socket_cleanup();
         return 1;
     }
-    // Five contexts can page under WDDM on 32 GB cards and run slower than four.
-    if (!opt.pipeline_set && prop.totalGlobalMem >= (28ull << 30))
-        opt.pipeline = TARI_C29_MAX_PIPELINE < 4 ? TARI_C29_MAX_PIPELINE : 4;
     printf("TARI.Miner C29 %s on %s (%.0f GB, sm_%d%d)\n",
            TARI_MINER_VERSION, prop.name, prop.totalGlobalMem / 1e9, prop.major, prop.minor);
     printf("pool=%s worker=%s\n", opt.pool.c_str(), opt.worker.c_str());
@@ -708,6 +719,18 @@ int main(int argc, char **argv) {
         return 1;
     }
     contexts.push_back(ctx);
+    size_t free_after_first = 0, total_after_first = 0;
+    cudaError_t memory_rc = cudaMemGetInfo(&free_after_first, &total_after_first);
+    if (memory_rc != cudaSuccess)
+        cudaGetLastError();
+    opt.pipeline = tari_miner::choose_pipeline_depth(
+        opt.pipeline_set,
+        opt.pipeline,
+        driver_mode(prop),
+        free_after_first,
+        solver_context_bytes(ctx),
+        memory_rc == cudaSuccess
+    );
     for (int i = 1; i < opt.pipeline; ++i) {
         if (!have_device_memory_for_extra_solver_ctx(contexts[0])) {
             fprintf(stderr, "warning: not enough free VRAM for pipeline solver %d; using pipeline=%zu\n",
@@ -901,144 +924,6 @@ int main(int argc, char **argv) {
             report_speed();
             throttle();
         } else {
-#if SOLVER_PRELAUNCH_NEXT
-            struct HostEdgeBuffer {
-                uint2 *ptr = nullptr;
-                bool pinned = false;
-            };
-            std::vector<HostEdgeBuffer> edge_buffers((size_t)opt.pipeline * 2);
-            for (HostEdgeBuffer &b : edge_buffers) {
-                cudaError_t pin_rc =
-                    cudaMallocHost((void **)&b.ptr, sizeof(uint2) * (size_t)MAXEDGES);
-                if (pin_rc == cudaSuccess) {
-                    b.pinned = true;
-                } else {
-                    cudaGetLastError();
-                    b.ptr = new uint2[MAXEDGES];
-                }
-            }
-
-            struct PendingTrim {
-                std::future<SolverTrimResult> future;
-                Job job;
-                uint64_t nonce = 0;
-                siphash_keys keys;
-                uint2 *edges = nullptr;
-                bool active = false;
-            };
-            std::vector<PendingTrim> pending((size_t)opt.pipeline);
-            std::vector<int> next_buffer((size_t)opt.pipeline, 0);
-            uint64_t done = 0;
-
-            auto launch_trim = [&](int slot) -> bool {
-                double launch_elapsed = now_sec() - start;
-                if (opt.max_runtime_sec > 0 && launch_elapsed >= opt.max_runtime_sec) return false;
-                if (!pool.alive()) return false;
-                Job launch_job = pool.current_job();
-                if (launch_job.seq == 0) return false;
-                if (launch_job.seq != last_seq) {
-                    last_seq = launch_job.seq;
-                    base = nonce_prefix_base(launch_job.xn_hex, &mask);
-                    counter = ((uint64_t)(now_sec() * 1000000.0)) & mask;
-                }
-                uint64_t nonce = base | (counter++ & mask);
-                SolverCtx *slot_ctx = contexts[(size_t)slot];
-                int buf = next_buffer[(size_t)slot];
-                next_buffer[(size_t)slot] = buf ^ 1;
-                uint2 *out = edge_buffers[(size_t)slot * 2 + (size_t)buf].ptr;
-                siphash_keys keys = derive_keys(nonce, launch_job);
-                slot_ctx->trimmer.sipkeys = keys;
-                slot_ctx->sols.clear();
-                pending[(size_t)slot].job = launch_job;
-                pending[(size_t)slot].nonce = nonce;
-                pending[(size_t)slot].keys = keys;
-                pending[(size_t)slot].edges = out;
-                pending[(size_t)slot].active = true;
-                pending[(size_t)slot].future = std::async(std::launch::async, [slot_ctx, out, device = opt.device]() {
-                    return slot_ctx->trim_copy_to_checked(out, device);
-                });
-                return true;
-            };
-
-            auto drain_pending = [&]() {
-                for (int slot = 0; slot < opt.pipeline; ++slot) {
-                    if (pending[(size_t)slot].active) {
-                        SolverTrimResult trim =
-                            pending[(size_t)slot].future.get();
-                        pending[(size_t)slot].active = false;
-                        if (trim.cuda_error == cudaSuccess)
-                            graphs++;
-                        if (!exit_code)
-                            observe_trim(slot, trim);
-                    }
-                }
-            };
-
-            auto wait_pending = [&]() {
-                if (opt.intensity >= 100) return;
-                for (int slot = 0; slot < opt.pipeline; ++slot) {
-                    if (pending[(size_t)slot].active)
-                        pending[(size_t)slot].future.wait();
-                }
-            };
-
-            for (int slot = 0; slot < opt.pipeline; ++slot) {
-                if (!launch_trim(slot)) break;
-            }
-
-            while (pool.alive()) {
-                elapsed = now_sec() - start;
-                if (opt.max_runtime_sec > 0 && elapsed >= opt.max_runtime_sec) break;
-
-                int slot = (int)(done % (uint64_t)opt.pipeline);
-                if (!pending[(size_t)slot].active) {
-                    if (!launch_trim(slot)) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                        continue;
-                    }
-                }
-
-                SolverCtx *slot_ctx = contexts[(size_t)slot];
-                SolverTrimResult trim = pending[(size_t)slot].future.get();
-                Job sol_job = pending[(size_t)slot].job;
-                uint64_t nonce = pending[(size_t)slot].nonce;
-                siphash_keys keys = pending[(size_t)slot].keys;
-                uint2 *edge_buf = pending[(size_t)slot].edges;
-                pending[(size_t)slot].active = false;
-
-                if (trim.cuda_error == cudaSuccess)
-                    graphs++;
-                if (!observe_trim(slot, trim))
-                    break;
-
-                slot_ctx->sols.clear();
-                if (trim.nedges) {
-                    int cycle_rc = slot_ctx->findcycles_with_keys(
-                        edge_buf, trim.nedges, keys, slot_ctx->sols
-                    );
-                    if (cycle_rc != cudaSuccess) {
-                        report_cuda_failure(
-                            opt.device, slot, "cycle recovery", (cudaError_t)cycle_rc
-                        );
-                        exit_code = tari_miner::SOLVER_FAILURE_EXIT_CODE;
-                        break;
-                    }
-                }
-                consume_solutions(slot_ctx, sol_job, nonce);
-                launch_trim(slot);
-                done++;
-                report_speed();
-                wait_pending();
-                throttle();
-            }
-            drain_pending();
-            for (HostEdgeBuffer &b : edge_buffers) {
-                if (b.pinned)
-                    cudaFreeHost(b.ptr);
-                else
-                    delete[] b.ptr;
-            }
-#else
             struct PendingTrim {
                 std::future<SolverTrimResult> future;
                 Job job;
@@ -1134,7 +1019,6 @@ int main(int argc, char **argv) {
                 throttle();
             }
             drain_pending();
-#endif
         }
         if (exit_code)
             break;

@@ -22,7 +22,9 @@
 #include <vector>
 #include <chrono>
 #include <future>
+#include <fstream>
 
+#include "tari_miner_pipeline.h"
 #include "tari_miner_reliability.h"
 #include "version.h"
 
@@ -54,14 +56,14 @@
 #ifndef TARI_C29_SQUASH_OUTPUT
 #define TARI_C29_SQUASH_OUTPUT 1
 #endif
-#ifndef TARI_C29_MAX_PIPELINE
-#define TARI_C29_MAX_PIPELINE 5
-#endif
-#ifndef SOLVER_PRELAUNCH_NEXT
-#define SOLVER_PRELAUNCH_NEXT 0
-#endif
 #ifndef SOLVER_CPULOAD
 #define SOLVER_CPULOAD 0
+#endif
+#ifndef TARI_C29_REFERENCE_BUILD
+#define TARI_C29_REFERENCE_BUILD 0
+#endif
+#ifndef TARI_C29_BUILD_ARCH
+#define TARI_C29_BUILD_ARCH 0
 #endif
 #define SQUASH_OUTPUT TARI_C29_SQUASH_OUTPUT
 #define main reference_mean_main_unused
@@ -73,6 +75,25 @@
 static double now_sec() {
     using namespace std::chrono;
     return duration_cast<duration<double>>(steady_clock::now().time_since_epoch()).count();
+}
+
+static tari_miner::DriverMode driver_mode(const cudaDeviceProp &prop) {
+#if defined(_WIN32)
+    return prop.tccDriver
+        ? tari_miner::DriverMode::WindowsTcc
+        : tari_miner::DriverMode::WindowsWddm;
+#else
+    (void)prop;
+    return tari_miner::DriverMode::Linux;
+#endif
+}
+
+static size_t solver_context_bytes(const SolverCtx *ctx) {
+    size_t bytes = ctx->trimmer.globalbytes();
+#if RECOVERY_SMALL_OUTPUT
+    bytes += PROOFSIZE * sizeof(u32);
+#endif
+    return bytes;
 }
 
 static int parse_hex32(const char *hex, uint8_t out[32]) {
@@ -106,6 +127,7 @@ int main(int argc, char **argv) {
     uint64_t target = 1;                 // mainnet C29 min_difficulty = 1
     int pipeline = 2;
     bool pipeline_set = false;
+    const char *recall_path = nullptr;
     int ntrims_override = 0;
     int gena_blocks = -1, gena_tpb = -1, genb_tpb = -1;
     int trim_tpb = -1, tail_tpb = -1, recover_blocks = -1, recover_tpb = -1;
@@ -118,6 +140,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--nonce") && i + 1 < argc) start_nonce = strtoull(argv[++i], 0, 10);
         else if (!strcmp(argv[i], "--target") && i + 1 < argc) target = strtoull(argv[++i], 0, 10);
         else if (!strcmp(argv[i], "--pipeline") && i + 1 < argc) { pipeline = atoi(argv[++i]); pipeline_set = true; }
+        else if (!strcmp(argv[i], "--recall-jsonl") && i + 1 < argc) recall_path = argv[++i];
         else if (!strcmp(argv[i], "--ntrims") && i + 1 < argc) ntrims_override = atoi(argv[++i]) & -2;
         else if (!strcmp(argv[i], "--gena-blocks") && i + 1 < argc) gena_blocks = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--gena-tpb") && i + 1 < argc) gena_tpb = atoi(argv[++i]);
@@ -136,12 +159,22 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             printf("usage: tari_c29_solver [--device N] [--count N] [--nonce N] "
                    "[--target D] [--pipeline N] [--ntrims N] [--mining-hash <64hex>] "
+                   "[--recall-jsonl FILE] "
                    "[--gena-blocks N] [--gena-tpb N] [--genb-tpb N] "
                    "[--trim-tpb N] [--tail-tpb N] [--recover-blocks N] [--recover-tpb N] "
                    "[--version]\n");
             return 0;
         } else {
             fprintf(stderr, "unknown or incomplete option: %s\n", argv[i]);
+            return 2;
+        }
+    }
+
+    std::ofstream recall;
+    if (recall_path) {
+        recall.open(recall_path, std::ios::out | std::ios::trunc);
+        if (!recall) {
+            fprintf(stderr, "cannot open --recall-jsonl output: %s\n", recall_path);
             return 2;
         }
     }
@@ -155,13 +188,13 @@ int main(int argc, char **argv) {
     if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
         fprintf(stderr, "no CUDA device %d\n", device); return 1;
     }
-    // Five contexts can page under WDDM on 32 GB cards and run slower than four.
-    if (!pipeline_set && prop.totalGlobalMem >= (28ull << 30))
-        pipeline = TARI_C29_MAX_PIPELINE < 4 ? TARI_C29_MAX_PIPELINE : 4;
     printf("TARI.Miner C29 solver %s on %s (%.0f GB, sm_%d%d)\n",
            TARI_MINER_VERSION, prop.name, prop.totalGlobalMem / 1e9, prop.major, prop.minor);
-    { char hx[65]; for (int i = 0; i < 32; i++) sprintf(hx + 2 * i, "%02x", mining_hash[i]); hx[64] = 0;
-      printf("mining_hash = %s\n", hx); }
+    char mining_hash_hex[65];
+    for (int i = 0; i < 32; i++)
+        sprintf(mining_hash_hex + 2 * i, "%02x", mining_hash[i]);
+    mining_hash_hex[64] = 0;
+    printf("mining_hash = %s\n", mining_hash_hex);
     printf("nonces      = %llu .. %llu  (%llu graphs)\n",
            (unsigned long long)start_nonce,
            (unsigned long long)(start_nonce + count - 1),
@@ -183,19 +216,47 @@ int main(int argc, char **argv) {
     if (tail_tpb > 0) params.tailtpb = (uint16_t)tail_tpb;
     if (recover_blocks > 0) params.recoverblocks = (uint16_t)recover_blocks;
     if (recover_tpb > 0) params.recovertpb = (uint16_t)recover_tpb;
-    if (pipeline < 1) pipeline = 1;
-    if (pipeline > TARI_C29_MAX_PIPELINE) pipeline = TARI_C29_MAX_PIPELINE; // keep probes inside sane VRAM use
-
     SolverCtx *ctx = create_solver_ctx(&params);
     if (!ctx || !ctx->trimmer.initsuccess) {
         fprintf(stderr, "failed to init solver (need ~6GB VRAM). reason: %s\n", LAST_ERROR_REASON);
         return 1;
     }
+    size_t free_after_first = 0, total_after_first = 0;
+    cudaError_t memory_rc = cudaMemGetInfo(&free_after_first, &total_after_first);
+    if (memory_rc != cudaSuccess)
+        cudaGetLastError();
+    pipeline = tari_miner::choose_pipeline_depth(
+        pipeline_set,
+        pipeline,
+        driver_mode(prop),
+        free_after_first,
+        solver_context_bytes(ctx),
+        memory_rc == cudaSuccess
+    );
 
     uint64_t graphs = 0, cycles = 0, shares = 0, bugs = 0;
     int exit_code = 0;
     double t0 = 0.0;
     std::vector<SolverCtx*> extra_contexts;
+    bool recall_run_written = false;
+
+    auto write_recall_run = [&]() {
+        if (!recall.is_open() || recall_run_written)
+            return;
+        recall
+            << "{\"type\":\"run\",\"mining_hash\":\"" << mining_hash_hex
+            << "\",\"start_nonce\":" << (unsigned long long)start_nonce
+            << ",\"count\":" << (unsigned long long)count
+            << ",\"pipeline\":" << pipeline
+            << ",\"ntrims\":" << (unsigned)params.ntrims
+            << ",\"compiled_ntrims\":" << TARI_C29_DEFAULT_NTRIMS
+            << ",\"arch\":\"sm_" << TARI_C29_BUILD_ARCH
+            << "\",\"device_arch\":\"sm_" << prop.major << prop.minor
+            << "\",\"profile\":\""
+            << (TARI_C29_REFERENCE_BUILD ? "reference" : "release")
+            << "\"}\n";
+        recall_run_written = true;
+    };
 
     auto inject_keys = [&](SolverCtx *c, uint64_t nonce) {
         tari_siphash_keys k;
@@ -224,6 +285,18 @@ int main(int argc, char **argv) {
                 printf("  nonce %llu: 42-cycle VERIFIED, C29 difficulty = %llu%s\n",
                        (unsigned long long)nonce, (unsigned long long)diff,
                        is_share ? "   *** SHARE (>= target) ***" : "");
+                if (recall.is_open()) {
+                    recall
+                        << "{\"type\":\"cycle\",\"nonce\":"
+                        << (unsigned long long)nonce
+                        << ",\"difficulty\":" << (unsigned long long)diff
+                        << ",\"edges\":[";
+                    for (int i = 0; i < TARI_C29_PROOFSIZE; i++) {
+                        if (i) recall << ',';
+                        recall << edges[i];
+                    }
+                    recall << "]}\n";
+                }
             } else {
                 bugs++;
                 printf("  nonce %llu: GPU returned a cycle but host verify FAILED (rc=%d) "
@@ -247,6 +320,7 @@ int main(int argc, char **argv) {
 
     if (pipeline <= 1) {
       tari_miner::SolverWatchdog watchdog;
+      write_recall_run();
       t0 = now_sec();
       for (uint64_t r = 0; r < count; r++) {
         uint64_t nonce = start_nonce + r;
@@ -290,113 +364,12 @@ int main(int argc, char **argv) {
         }
         pipeline = (int)contexts.size();
         printf("solver pipeline=%d context%s\n", pipeline, pipeline == 1 ? "" : "s");
+        write_recall_run();
         std::vector<tari_miner::SolverWatchdog> watchdogs((size_t)pipeline);
         for (size_t i = 1; i < contexts.size(); i++)
             extra_contexts.push_back(contexts[i]);
         t0 = now_sec();
 
-#if SOLVER_PRELAUNCH_NEXT
-        struct HostEdgeBuffer {
-            uint2 *ptr = nullptr;
-            bool pinned = false;
-        };
-        std::vector<HostEdgeBuffer> edge_buffers((size_t)pipeline * 2);
-        for (HostEdgeBuffer &b : edge_buffers) {
-            const size_t edgeBytes = sizeof(uint2) * (size_t)MAXEDGES;
-            cudaError_t pin_rc = cudaMallocHost((void **)&b.ptr, edgeBytes);
-            if (pin_rc == cudaSuccess) {
-                b.pinned = true;
-            } else {
-                cudaGetLastError();
-                b.ptr = new uint2[edgeBytes / sizeof(uint2)];
-                b.pinned = false;
-            }
-        }
-
-        struct PendingTrim {
-            std::future<SolverTrimResult> future;
-            uint64_t nonce = 0;
-            siphash_keys keys;
-            uint2 *edges = nullptr;
-            bool active = false;
-        };
-        std::vector<PendingTrim> pending((size_t)pipeline);
-        std::vector<int> next_buffer((size_t)pipeline, 0);
-        uint64_t next = 0;
-
-        auto set_keys = [&](SolverCtx *c, uint64_t nonce) -> siphash_keys {
-            tari_siphash_keys tk;
-            tari_c29_derive_keys(nonce, mining_hash, &tk);
-            siphash_keys sk;
-            sk.k0 = tk.k0; sk.k1 = tk.k1; sk.k2 = tk.k2; sk.k3 = tk.k3;
-            c->trimmer.sipkeys = sk;
-            c->sols.clear();
-            return sk;
-        };
-
-        auto launch_trim = [&](int slot) {
-            SolverCtx *c = contexts[(size_t)slot];
-            uint64_t nonce = start_nonce + next++;
-            int buf = next_buffer[(size_t)slot];
-            next_buffer[(size_t)slot] = buf ^ 1;
-            uint2 *out = edge_buffers[(size_t)slot * 2 + (size_t)buf].ptr;
-            pending[(size_t)slot].nonce = nonce;
-            pending[(size_t)slot].keys = set_keys(c, nonce);
-            pending[(size_t)slot].edges = out;
-            pending[(size_t)slot].active = true;
-            pending[(size_t)slot].future = std::async(std::launch::async, [c, out, device]() {
-                return c->trim_copy_to_checked(out, device);
-            });
-        };
-
-        auto drain_pending = [&]() {
-            for (PendingTrim &item : pending) {
-                if (item.active) {
-                    item.future.get();
-                    item.active = false;
-                }
-            }
-        };
-
-        int initial = (count < (uint64_t)pipeline) ? (int)count : pipeline;
-        for (int slot = 0; slot < initial; slot++) launch_trim(slot);
-
-        for (uint64_t done = 0; done < count; done++) {
-            int slot = (int)(done % (uint64_t)pipeline);
-            SolverCtx *c = contexts[(size_t)slot];
-            SolverTrimResult trim = pending[(size_t)slot].future.get();
-            uint64_t nonce = pending[(size_t)slot].nonce;
-            siphash_keys keys = pending[(size_t)slot].keys;
-            uint2 *edgeBuf = pending[(size_t)slot].edges;
-            pending[(size_t)slot].active = false;
-
-            if (trim.cuda_error == cudaSuccess)
-                graphs++;
-            if (!observe_trim(watchdogs[(size_t)slot], slot, trim))
-                break;
-
-            c->sols.clear();
-            if (trim.nedges) {
-                int cycle_rc = c->findcycles_with_keys(edgeBuf, trim.nedges, keys, c->sols);
-                if (cycle_rc != cudaSuccess) {
-                    report_cuda_failure(device, slot, "cycle recovery", (cudaError_t)cycle_rc);
-                    exit_code = tari_miner::SOLVER_FAILURE_EXIT_CODE;
-                    break;
-                }
-            }
-            consume_solutions(c, nonce);
-            if (next < count)
-                launch_trim(slot);
-        }
-
-        drain_pending();
-        for (HostEdgeBuffer &b : edge_buffers) {
-            if (b.pinned)
-                cudaFreeHost(b.ptr);
-            else
-                delete[] b.ptr;
-        }
-#else
         struct PendingTrim {
             std::future<SolverTrimResult> future;
             uint64_t nonce = 0;
@@ -450,7 +423,6 @@ int main(int argc, char **argv) {
                 launch_trim(slot);
         }
         drain_pending();
-#endif
     }
 
     double elapsed = now_sec() - t0;
@@ -461,6 +433,20 @@ int main(int argc, char **argv) {
            (unsigned long long)cycles, graphs / 42.0);
     printf("verify failures: %llu  (MUST be 0)\n", (unsigned long long)bugs);
     printf("shares (>=%llu)  : %llu\n", (unsigned long long)target, (unsigned long long)shares);
+    if (recall.is_open()) {
+        recall
+            << "{\"type\":\"summary\",\"graphs\":"
+            << (unsigned long long)graphs
+            << ",\"cycles\":" << (unsigned long long)cycles
+            << ",\"verify_failures\":" << (unsigned long long)bugs
+            << "}\n";
+        recall.flush();
+        if (!recall) {
+            fprintf(stderr, "failed writing --recall-jsonl output: %s\n", recall_path);
+            if (!exit_code)
+                exit_code = 2;
+        }
+    }
 
     for (SolverCtx *extra : extra_contexts)
         destroy_solver_ctx(extra);
