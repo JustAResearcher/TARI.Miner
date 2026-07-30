@@ -176,7 +176,8 @@ $Checksums = foreach ($Archive in $Archives) {
     "$Hash  $(Split-Path -Leaf $Archive)"
 }
 $ChecksumsPath = Join-Path $ReleaseRoot 'SHA256SUMS.txt'
-$Checksums | Set-Content -LiteralPath $ChecksumsPath -Encoding ascii
+$ChecksumText = ($Checksums -join "`n") + "`n"
+[IO.File]::WriteAllText($ChecksumsPath, $ChecksumText, [Text.Encoding]::ASCII)
 
 $ReleaseNotes = @'
 # TARI.Miner C29 v{0}
