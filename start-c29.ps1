@@ -154,16 +154,20 @@ try {
 
     # A worker exits non-zero only for something a restart must clear: a
     # repeatedly rejected login (4), a failed solver (5), an unresponsive pool
-    # (6). Stop the survivors and surface that code, so a rig supervisor sees the
-    # failure instead of a launcher still babysitting its healthy GPUs.
+    # (6), or invalid pool protocol data (7). Stop the survivors and surface that
+    # code, so a rig supervisor sees the failure instead of a launcher still
+    # babysitting its healthy GPUs.
     while ($true) {
         $exited = @($workers | Where-Object { $_.HasExited })
-        foreach ($worker in $exited) {
-            if ($worker.ExitCode -ne 0 -and $workerExitCode -eq 0) {
-                Write-Host "ERROR: Miner worker PID $($worker.Id) exited with code $($worker.ExitCode)."
-                $workerExitCode = $worker.ExitCode
-                $workerFailed = $true
-            }
+        $failed = @($exited |
+            Where-Object { $_.ExitCode -ne 0 } |
+            Sort-Object ExitTime, Id |
+            Select-Object -First 1)
+        if ($failed.Count -gt 0) {
+            $worker = $failed[0]
+            Write-Host "ERROR: Miner worker PID $($worker.Id) exited with code $($worker.ExitCode)."
+            $workerExitCode = $worker.ExitCode
+            $workerFailed = $true
         }
         if ($workerFailed) {
             $alive = @($workers | Where-Object { -not $_.HasExited })

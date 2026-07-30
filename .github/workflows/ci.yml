@@ -80,6 +80,9 @@ jobs:
             hiveos/h-run.sh \
             hiveos/h-stats.sh
 
+      - name: Run shell launcher regressions
+        run: bash tests/start_c29_launcher_test.sh
+
   windows:
     name: Windows CPU and launcher checks
     runs-on: windows-latest
@@ -132,6 +135,10 @@ jobs:
           if ($manifest -contains 13) {
             throw 'HiveOS manifest must use LF line endings.'
           }
+
+      - name: Run PowerShell launcher regressions
+        shell: powershell
+        run: .\tests\start_c29_launcher_test.ps1
 
       - name: Run GPU recall verifier fixtures
         shell: powershell

@@ -185,12 +185,10 @@ together: a pool defines both the endpoint and the login format it accepts.
 Passing `--login-separator` after the starter command works as well.
 
 The wallet is checked before the first connection. Whitespace, control
-characters, and anything longer than the longest possible Tari address are
-rejected outright. Beyond that, a login that is already shaped like a Tari
-address — one of the two Base58 address lengths, and nothing but letters and
-digits — must use only Base58 characters, so a `0`, `O`, `I`, or `l` from a
-mistyped or misread address is caught before mining starts. Logins of any other
-shape are passed through untouched, because pools exist that expect a username
+characters, and inputs larger than the longest supported Tari text encoding are
+rejected outright. A login with one of the two Base58 address lengths that uses
+a `0`, `O`, `I`, or `l` emits a typo warning before mining starts. It is not
+rejected solely for that warning, because pools exist that expect a username
 rather than an address.
 
 The pool connection is plain TCP. Do not use a sensitive password for
@@ -211,6 +209,7 @@ that needs a restart or an operator, so a rig supervisor can act on the code:
 | 4 | The pool rejected the login repeatedly; check wallet, worker, password, and separator |
 | 5 | Solver failure: a CUDA error, or three consecutive graphs with no surviving edges |
 | 6 | The pool accepted the connection but never sent a job |
+| 7 | The pool repeatedly sent invalid protocol data |
 
 The starters propagate these. When a GPU worker exits non-zero, the starter
 stops the remaining workers and exits with that same code, rather than carrying

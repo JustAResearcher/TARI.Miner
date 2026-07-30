@@ -123,8 +123,25 @@ fi
 
 kill_workers() {
     if ((${#pids[@]} > 0)); then
-        kill "${pids[@]}" 2>/dev/null || true
-        wait "${pids[@]}" 2>/dev/null || true
+        local all_pids=("${pids[@]}")
+        local survivors=("${pids[@]}")
+        local pass pid
+        kill "${all_pids[@]}" 2>/dev/null || true
+        # A wedged miner must not hold the launcher (and therefore the rig
+        # supervisor) forever. Give TERM two seconds, then force the survivors.
+        for ((pass = 0; pass < 20 && ${#survivors[@]} > 0; pass++)); do
+            sleep 0.1
+            local remaining=()
+            for pid in "${survivors[@]}"; do
+                kill -0 "$pid" 2>/dev/null && remaining+=("$pid")
+            done
+            survivors=("${remaining[@]}")
+        done
+        if ((${#survivors[@]} > 0)); then
+            kill -KILL "${survivors[@]}" 2>/dev/null || true
+        fi
+        wait "${all_pids[@]}" 2>/dev/null || true
+        pids=()
     fi
 }
 
@@ -136,12 +153,13 @@ stop_workers() {
 trap stop_workers INT TERM
 
 status=0
-((missing == 0)) || status=1
+((missing == 0)) || status=5
 
 # A miner worker exits non-zero when it hits something only a restart can clear:
-# a repeatedly rejected login (4), a failed solver (5), an unresponsive pool (6).
-# Stop the surviving workers and exit with that code, so a rig supervisor sees
-# the failure instead of a launcher that keeps running its healthy GPUs.
+# a repeatedly rejected login (4), a failed solver (5), an unresponsive pool
+# (6), or invalid pool protocol data (7). Stop the surviving workers and exit
+# with that code, so a rig supervisor sees the failure instead of a launcher
+# that keeps running its healthy GPUs.
 worker_failure=0
 while ((${#pids[@]} > 0)); do
     remaining=()

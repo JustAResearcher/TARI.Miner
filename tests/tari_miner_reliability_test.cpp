@@ -52,13 +52,36 @@ static void test_wallet_validation() {
               tari_miner::WalletValidationError::Empty,
           "an empty wallet is rejected");
     check(tari_miner::validate_wallet(
-              std::string(tari_miner::MAX_WALLET_LENGTH, 'a')) ==
+              std::string(tari_miner::TARI_HEX_MAX_LENGTH, 'a')) ==
               tari_miner::WalletValidationError::None,
-          "the longest possible address length is accepted");
+          "the longest hex address length is accepted");
+
+    std::string max_emoji_address;
+    for (size_t i = 0; i < tari_miner::TARI_DUAL_INTERNAL_MAX_SIZE; ++i)
+        max_emoji_address += "\xf0\x9f\x90\xa2";
+    check(max_emoji_address.size() ==
+              tari_miner::TARI_EMOJI_MAX_UTF8_LENGTH &&
+              tari_miner::validate_wallet(max_emoji_address) ==
+                  tari_miner::WalletValidationError::None,
+          "the longest UTF-8 emoji address length is accepted");
+
+    std::string grouped_emoji_address;
+    for (size_t i = 0; i < tari_miner::TARI_DUAL_INTERNAL_MAX_SIZE; ++i) {
+        if (i) grouped_emoji_address.push_back('|');
+        grouped_emoji_address += "\xf0\x9f\x90\xa2";
+    }
+    check(grouped_emoji_address.size() ==
+              tari_miner::TARI_GROUPED_EMOJI_MAX_UTF8_LENGTH &&
+              tari_miner::validate_wallet(grouped_emoji_address) ==
+                  tari_miner::WalletValidationError::None,
+          "the longest pipe-grouped emoji address length is accepted");
+    check(tari_miner::validate_wallet(std::string(444, 'z')) ==
+              tari_miner::WalletValidationError::None,
+          "a long generic pool login is accepted");
     check(tari_miner::validate_wallet(
               std::string(tari_miner::MAX_WALLET_LENGTH + 1, 'a')) ==
               tari_miner::WalletValidationError::TooLong,
-          "a wallet longer than any Tari address is rejected");
+          "an overlong wallet or login is rejected");
 }
 
 static void test_tari_address_charset() {
@@ -66,8 +89,8 @@ static void test_tari_address_charset() {
     // A dual address is 89-443 Base58 characters; a single address is 45-48.
     // The filler is deliberately not a hex digit: a login made only of [0-9a-f]
     // is exempt from the charset rule, and a real address is not hex.
-    const std::string dual(91, 'z');
-    const std::string single(46, 'z');
+    const std::string dual = "f2" + std::string(89, 'z');
+    const std::string single = "f2" + std::string(44, 'z');
     check(tari_miner::validate_wallet(dual) ==
               tari_miner::WalletValidationError::None,
           "a dual-length Base58 address is accepted");
@@ -88,6 +111,25 @@ static void test_tari_address_charset() {
                   tari_miner::WalletValidationError::TariAddressCharset,
               "a single-length address with a non-Base58 character is rejected");
     }
+
+    std::string generic_single = "12" + std::string(44, 'z');
+    generic_single[20] = '0';
+    check(tari_miner::validate_wallet(generic_single) ==
+              tari_miner::WalletValidationError::TariAddressCharset &&
+              !tari_miner::wallet_validation_is_fatal(
+                  tari_miner::validate_wallet(generic_single)),
+          "an ambiguous address-length login warns but is not rejected");
+    std::string generic_dual = "f2" + std::string(89, 'z');
+    generic_dual[40] = 'O';
+    check(tari_miner::validate_wallet(generic_dual) ==
+              tari_miner::WalletValidationError::TariAddressCharset &&
+              !tari_miner::wallet_validation_is_fatal(
+                  tari_miner::validate_wallet(generic_dual)),
+          "a long ambiguous login warns but is not rejected");
+    std::string prefix_typo = "fO" + std::string(89, 'z');
+    check(tari_miner::validate_wallet(prefix_typo) ==
+              tari_miner::WalletValidationError::TariAddressCharset,
+          "a Base58 typo in the Tari prefix is detected");
 
     // Lengths between and beyond the address ranges are logins, not addresses.
     for (size_t length : {size_t(44), size_t(60), size_t(88)}) {
@@ -247,6 +289,45 @@ static void test_pool_silence_policy() {
     for (unsigned i = 0; i < tari_miner::MAX_SILENT_CYCLES; ++i)
         fatal = fatal_policy.record_silence();
     check(fatal, "a persistently silent pool eventually exits");
+
+    using tari_miner::JobWaitOutcome;
+    check(tari_miner::counts_as_pool_silence(JobWaitOutcome::Timeout),
+          "a connected no-job timeout counts as pool silence");
+    check(!tari_miner::counts_as_pool_silence(JobWaitOutcome::Disconnected) &&
+              !tari_miner::counts_as_pool_silence(JobWaitOutcome::ProtocolError) &&
+              !tari_miner::counts_as_pool_silence(JobWaitOutcome::LoginRejected),
+          "disconnects and protocol/login errors are not pool silence");
+    tari_miner::PoolSilencePolicy interrupted;
+    interrupted.record_silence();
+    interrupted.reset();
+    check(interrupted.consecutive_silences() == 0,
+          "non-silent activity breaks a silence streak");
+}
+
+static void test_protocol_error_policy() {
+    std::puts("Pool protocol error policy:");
+    check(tari_miner::POOL_PROTOCOL_EXIT_CODE == 7,
+          "a persistently invalid pool uses exit code 7");
+    tari_miner::ProtocolErrorPolicy policy;
+    check(!policy.record_failure() && !policy.record_failure(),
+          "the first two protocol errors retry");
+    check(policy.record_failure() &&
+              policy.consecutive_failures() ==
+                  tari_miner::MAX_PROTOCOL_ERRORS,
+          "the third consecutive protocol error exits");
+    policy.record_valid_job(1);
+    check(policy.consecutive_failures() == tari_miner::MAX_PROTOCOL_ERRORS,
+          "an initial job on a retry does not reset protocol errors");
+    policy.record_valid_job(2);
+    check(policy.consecutive_failures() == 0,
+          "a valid job update resets protocol errors");
+    policy.record_failure();
+    policy.record_valid_job(2);
+    check(!policy.record_failure() && policy.consecutive_failures() == 1,
+          "a valid update observed on the error path resets before counting");
+    policy.reset();
+    check(policy.consecutive_failures() == 0,
+          "a clean connection or valid job update resets protocol errors");
 }
 
 static void test_login_failure_policy() {
@@ -310,6 +391,7 @@ int main() {
     test_pending_submit_bound();
     test_status_ok_acceptance();
     test_pool_silence_policy();
+    test_protocol_error_policy();
     test_login_failure_policy();
     test_solver_watchdog();
     std::printf("\n%s (%d failure%s)\n",

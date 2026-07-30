@@ -240,6 +240,11 @@ static void test_strict_uint_parsing() {
           "a quoted height is not an unsigned value");
     check(!tari_pool::json_uint_from("{\"job\":{\"height\":12x}}", "height", value),
           "trailing garbage is rejected");
+    check(!tari_pool::json_root_uint(
+              "{\"id\":4 garbage,\"result\":true}", "id", value),
+          "whitespace followed by garbage is rejected");
+    check(!tari_pool::json_root_uint("{\"id\":04}", "id", value),
+          "a leading-zero integer is rejected");
     check(!tari_pool::json_uint_from(
               "{\"job\":{\"height\":99999999999999999999999}}", "height", value),
           "an overflowing height is rejected");
@@ -253,6 +258,15 @@ static void test_strict_uint_parsing() {
 
 static void test_result_status_ok() {
     std::puts("Submit result status:");
+    check(tari_pool::json_root_object_is_valid(
+              "{\"id\":4,\"result\":true,\"error\":null}"),
+          "a normal bare-true response is valid JSON");
+    check(!tari_pool::json_root_object_is_valid(
+              "{\"id\":4,,\"result\":true}"),
+          "a malformed bare-true response is invalid JSON");
+    check(!tari_pool::json_root_object_is_valid(
+              "{\"id\":4,\"result\":true garbage}"),
+          "garbage after a bare result is invalid JSON");
     check(tari_pool::json_result_status_ok(
               "{\"id\":4,\"result\":{\"status\":\"OK\"},\"error\":null}"),
           "a status object is recognised as success");
@@ -263,6 +277,10 @@ static void test_result_status_ok() {
               "{\"id\":1,\"result\":{\"id\":\"s\",\"job\":{\"status\":\"NO\"},"
               "\"status\":\"OK\"}}"),
           "a nested job object does not hide the root status");
+    check(tari_pool::json_result_status_ok(
+              "{\"meta\":[null,true,false,-1.25e+2],\"result\":{"
+              "\"note\":\"line\\n\\u0041\",\"status\":\"OK\"}}"),
+          "valid JSON values and escapes remain accepted");
 
     check(!tari_pool::json_result_status_ok(
               "{\"id\":4,\"result\":{\"status\":\"KO\"}}"),
@@ -278,6 +296,33 @@ static void test_result_status_ok() {
     check(!tari_pool::json_result_status_ok(
               "{\"id\":4,\"result\":{\"note\":\"} \\\" {\",\"status\":\"OK\""),
           "an unterminated result object is not success");
+    check(!tari_pool::json_result_status_ok(
+              "{\"id\":4,\"result\":{\"status\":\"OK\"]}"),
+          "mismatched result delimiters are not success");
+    check(!tari_pool::json_result_status_ok(
+              "{\"id\":4,\"result\":{\"status\":\"OK\"junk}}"),
+          "garbage after the status string is not success");
+    check(!tari_pool::json_result_status_ok(
+              "{\"id\":4,\"result\":{\"status\":\"OK\"}junk}"),
+          "garbage after the result object is not success");
+    check(!tari_pool::json_result_status_ok(
+              "{\"id\":4,\"result\":{\"status\":\"O\\K\"}}"),
+          "an invalid string escape is not success");
+    check(!tari_pool::json_result_status_ok(
+              "{\"id\":4,\"result\":{\"status\":\"OK\"}}junk"),
+          "garbage after the root object is not success");
+    check(!tari_pool::json_result_status_ok(
+              "{\"id\":4,\"result\":{\"status\":\"OK\"}]"),
+          "a mismatched root delimiter is not success");
+    check(!tari_pool::json_result_status_ok(
+              "{\"id\":4,\"result\":{\"note\":\"\\K\",\"status\":\"OK\"}}"),
+          "an invalid escape elsewhere in the response is not success");
+    check(!tari_pool::json_result_status_ok(
+              "{\"id\":4,,\"result\":{\"status\":\"OK\"}}"),
+          "consecutive object commas are not success");
+    check(!tari_pool::json_result_status_ok(
+              "{\"id\":4,\"result\":{\"status\":\"OK\"},}"),
+          "a trailing object comma is not success");
 }
 
 int main() {

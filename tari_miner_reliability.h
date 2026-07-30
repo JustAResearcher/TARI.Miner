@@ -17,15 +17,22 @@ enum class WalletValidationError {
     TariAddressCharset,
 };
 
-// Base58 lengths a Tari address can have, from the consensus source at
-// base_layer/common_types/src/tari_address/mod.rs: a single address encodes to
-// 45-48 characters, a dual address to 89-443 (the upper bound covers the
-// payment-id field).
+// Tari address sizes from base_layer/common_types/src/tari_address/mod.rs.
+// Base58 single addresses encode to 45-48 characters and dual addresses to
+// 89-443. A dual address can contain 67-323 bytes once its optional 256-byte
+// payment ID is included; hex needs two characters per byte and each emoji is
+// at most four UTF-8 bytes.
 constexpr size_t TARI_SINGLE_ADDRESS_MIN_LENGTH = 45;
 constexpr size_t TARI_SINGLE_ADDRESS_MAX_LENGTH = 48;
 constexpr size_t TARI_DUAL_ADDRESS_MIN_LENGTH = 89;
 constexpr size_t TARI_DUAL_ADDRESS_MAX_LENGTH = 443;
-constexpr size_t MAX_WALLET_LENGTH = TARI_DUAL_ADDRESS_MAX_LENGTH;
+constexpr size_t TARI_DUAL_INTERNAL_MAX_SIZE = 67 + 256;
+constexpr size_t TARI_HEX_MAX_LENGTH = TARI_DUAL_INTERNAL_MAX_SIZE * 2;
+constexpr size_t TARI_EMOJI_MAX_UTF8_LENGTH =
+    TARI_DUAL_INTERNAL_MAX_SIZE * 4;
+constexpr size_t TARI_GROUPED_EMOJI_MAX_UTF8_LENGTH =
+    TARI_EMOJI_MAX_UTF8_LENGTH + TARI_DUAL_INTERNAL_MAX_SIZE - 1;
+constexpr size_t MAX_WALLET_LENGTH = TARI_GROUPED_EMOJI_MAX_UTF8_LENGTH;
 
 // Bitcoin base58: the digits and letters, minus 0 O I l. Those four are exactly
 // the characters a mistyped or OCR-read address tends to gain.
@@ -86,6 +93,11 @@ inline WalletValidationError validate_wallet(const std::string &wallet) {
             return WalletValidationError::TariAddressCharset;
     }
     return WalletValidationError::None;
+}
+
+inline bool wallet_validation_is_fatal(WalletValidationError error) {
+    return error != WalletValidationError::None &&
+           error != WalletValidationError::TariAddressCharset;
 }
 
 enum class PoolResponseKind {
@@ -200,6 +212,10 @@ public:
     }
 
     void record_job() {
+        reset();
+    }
+
+    void reset() {
         consecutive_silences_ = 0;
     }
 
@@ -222,6 +238,47 @@ public:
 
 private:
     unsigned consecutive_silences_ = 0;
+};
+
+enum class JobWaitOutcome {
+    Job,
+    LoginRejected,
+    ProtocolError,
+    Disconnected,
+    Timeout,
+};
+
+inline bool counts_as_pool_silence(JobWaitOutcome outcome) {
+    return outcome == JobWaitOutcome::Timeout;
+}
+
+constexpr unsigned MAX_PROTOCOL_ERRORS = 3;
+constexpr int POOL_PROTOCOL_EXIT_CODE = 7;
+
+class ProtocolErrorPolicy {
+public:
+    bool record_failure() {
+        consecutive_failures_++;
+        return consecutive_failures_ >= MAX_PROTOCOL_ERRORS;
+    }
+
+    void record_valid_job(uint64_t session_job_sequence) {
+        // The first job is expected before every retry, so it does not prove
+        // recovery from a pool that always fails on its first update.
+        if (session_job_sequence > 1)
+            reset();
+    }
+
+    void reset() {
+        consecutive_failures_ = 0;
+    }
+
+    unsigned consecutive_failures() const {
+        return consecutive_failures_;
+    }
+
+private:
+    unsigned consecutive_failures_ = 0;
 };
 
 constexpr unsigned MAX_CONSECUTIVE_ZERO_YIELDS = 3;

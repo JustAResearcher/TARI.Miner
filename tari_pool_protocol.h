@@ -173,17 +173,25 @@ inline bool parse_uint_at(
 
     uint64_t parsed = 0;
     size_t i = position;
+    if (json[position] == '0' && position + 1 < json.size() &&
+        json[position + 1] >= '0' && json[position + 1] <= '9') {
+        return false;
+    }
     for (; i < json.size() && json[i] >= '0' && json[i] <= '9'; ++i) {
         unsigned digit = (unsigned)(json[i] - '0');
         if (parsed > (std::numeric_limits<uint64_t>::max() - digit) / 10)
             return false;
         parsed = parsed * 10 + digit;
     }
+    while (i < json.size() &&
+           (json[i] == ' ' || json[i] == '\t' ||
+            json[i] == '\r' || json[i] == '\n')) {
+        i++;
+    }
     if (i < json.size()) {
         char delimiter = json[i];
         if (delimiter != ',' && delimiter != '}' && delimiter != ']' &&
-            delimiter != ' ' && delimiter != '\t' &&
-            delimiter != '\r' && delimiter != '\n') {
+            delimiter != ' ' && delimiter != '\t') {
             return false;
         }
     }
@@ -216,7 +224,8 @@ inline bool json_uint_from(
 inline bool json_string_at(
     const std::string &json,
     size_t position,
-    std::string &out
+    std::string &out,
+    size_t *end_position = nullptr
 ) {
     if (position >= json.size() || json[position] != '"') return false;
     std::string value;
@@ -224,13 +233,30 @@ inline bool json_string_at(
     for (size_t i = position + 1; i < json.size(); ++i) {
         char c = json[i];
         if (escaped) {
-            value.push_back(c);
+            if (c == 'u') {
+                if (i + 4 >= json.size()) return false;
+                for (size_t j = 1; j <= 4; ++j) {
+                    if (hex_value(json[i + j]) < 0) return false;
+                }
+                value.push_back('?');
+                i += 4;
+            } else if (c == '"' || c == '\\' || c == '/') {
+                value.push_back(c);
+            } else if (c == 'b' || c == 'f' || c == 'n' ||
+                       c == 'r' || c == 't') {
+                value.push_back('?');
+            } else {
+                return false;
+            }
             escaped = false;
         } else if (c == '\\') {
             escaped = true;
         } else if (c == '"') {
             out = value;
+            if (end_position) *end_position = i + 1;
             return true;
+        } else if ((unsigned char)c < 0x20) {
+            return false;
         } else {
             value.push_back(c);
         }
@@ -243,32 +269,55 @@ inline bool json_string_at(
 inline bool json_container_slice(
     const std::string &json,
     size_t position,
-    std::string &out
+    std::string &out,
+    size_t *end_position = nullptr
 ) {
     if (position >= json.size() ||
         (json[position] != '{' && json[position] != '[')) {
         return false;
     }
 
-    size_t depth = 0;
+    std::string expected_closers;
     bool in_string = false;
     bool escaped = false;
     for (size_t i = position; i < json.size(); ++i) {
         char c = json[i];
         if (in_string) {
-            if (escaped) escaped = false;
-            else if (c == '\\') escaped = true;
-            else if (c == '"') in_string = false;
+            if (escaped) {
+                if (c == 'u') {
+                    if (i + 4 >= json.size()) return false;
+                    for (size_t j = 1; j <= 4; ++j) {
+                        if (hex_value(json[i + j]) < 0) return false;
+                    }
+                    i += 4;
+                } else if (c != '"' && c != '\\' && c != '/' &&
+                           c != 'b' && c != 'f' && c != 'n' &&
+                           c != 'r' && c != 't') {
+                    return false;
+                }
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            } else if ((unsigned char)c < 0x20) {
+                return false;
+            }
             continue;
         }
         if (c == '"') {
             in_string = true;
         } else if (c == '{' || c == '[') {
-            depth++;
+            expected_closers.push_back(c == '{' ? '}' : ']');
         } else if (c == '}' || c == ']') {
-            depth--;
-            if (depth == 0) {
+            if (expected_closers.empty() ||
+                expected_closers.back() != c) {
+                return false;
+            }
+            expected_closers.pop_back();
+            if (expected_closers.empty()) {
                 out = json.substr(position, i - position + 1);
+                if (end_position) *end_position = i + 1;
                 return true;
             }
         }
@@ -276,19 +325,218 @@ inline bool json_container_slice(
     return false;
 }
 
+inline void json_skip_whitespace(const std::string &json, size_t &position) {
+    while (position < json.size() &&
+           (json[position] == ' ' || json[position] == '\t' ||
+            json[position] == '\r' || json[position] == '\n')) {
+        position++;
+    }
+}
+
+inline bool json_skip_string(const std::string &json, size_t &position) {
+    if (position >= json.size() || json[position++] != '"') return false;
+    while (position < json.size()) {
+        unsigned char c = (unsigned char)json[position++];
+        if (c == '"') return true;
+        if (c < 0x20) return false;
+        if (c != '\\') continue;
+        if (position >= json.size()) return false;
+        char escaped = json[position++];
+        if (escaped == 'u') {
+            if (position + 4 > json.size()) return false;
+            for (size_t i = 0; i < 4; ++i) {
+                if (hex_value(json[position + i]) < 0) return false;
+            }
+            position += 4;
+        } else if (escaped != '"' && escaped != '\\' && escaped != '/' &&
+                   escaped != 'b' && escaped != 'f' && escaped != 'n' &&
+                   escaped != 'r' && escaped != 't') {
+            return false;
+        }
+    }
+    return false;
+}
+
+inline bool json_skip_number(const std::string &json, size_t &position) {
+    if (position < json.size() && json[position] == '-') position++;
+    if (position >= json.size()) return false;
+    if (json[position] == '0') {
+        position++;
+        if (position < json.size() &&
+            json[position] >= '0' && json[position] <= '9') {
+            return false;
+        }
+    } else {
+        if (json[position] < '1' || json[position] > '9') return false;
+        while (position < json.size() &&
+               json[position] >= '0' && json[position] <= '9') {
+            position++;
+        }
+    }
+    if (position < json.size() && json[position] == '.') {
+        position++;
+        if (position >= json.size() ||
+            json[position] < '0' || json[position] > '9') {
+            return false;
+        }
+        while (position < json.size() &&
+               json[position] >= '0' && json[position] <= '9') {
+            position++;
+        }
+    }
+    if (position < json.size() &&
+        (json[position] == 'e' || json[position] == 'E')) {
+        position++;
+        if (position < json.size() &&
+            (json[position] == '+' || json[position] == '-')) {
+            position++;
+        }
+        if (position >= json.size() ||
+            json[position] < '0' || json[position] > '9') {
+            return false;
+        }
+        while (position < json.size() &&
+               json[position] >= '0' && json[position] <= '9') {
+            position++;
+        }
+    }
+    return true;
+}
+
+inline bool json_skip_value(
+    const std::string &json,
+    size_t &position,
+    unsigned depth
+);
+
+inline bool json_skip_object(
+    const std::string &json,
+    size_t &position,
+    unsigned depth
+) {
+    if (depth > 128 || position >= json.size() ||
+        json[position++] != '{') {
+        return false;
+    }
+    json_skip_whitespace(json, position);
+    if (position < json.size() && json[position] == '}') {
+        position++;
+        return true;
+    }
+    while (position < json.size()) {
+        if (!json_skip_string(json, position)) return false;
+        json_skip_whitespace(json, position);
+        if (position >= json.size() || json[position++] != ':') return false;
+        if (!json_skip_value(json, position, depth + 1)) return false;
+        json_skip_whitespace(json, position);
+        if (position < json.size() && json[position] == '}') {
+            position++;
+            return true;
+        }
+        if (position >= json.size() || json[position++] != ',') return false;
+        json_skip_whitespace(json, position);
+        if (position >= json.size() || json[position] == '}') return false;
+    }
+    return false;
+}
+
+inline bool json_skip_array(
+    const std::string &json,
+    size_t &position,
+    unsigned depth
+) {
+    if (depth > 128 || position >= json.size() ||
+        json[position++] != '[') {
+        return false;
+    }
+    json_skip_whitespace(json, position);
+    if (position < json.size() && json[position] == ']') {
+        position++;
+        return true;
+    }
+    while (position < json.size()) {
+        if (!json_skip_value(json, position, depth + 1)) return false;
+        json_skip_whitespace(json, position);
+        if (position < json.size() && json[position] == ']') {
+            position++;
+            return true;
+        }
+        if (position >= json.size() || json[position++] != ',') return false;
+        json_skip_whitespace(json, position);
+        if (position >= json.size() || json[position] == ']') return false;
+    }
+    return false;
+}
+
+inline bool json_skip_value(
+    const std::string &json,
+    size_t &position,
+    unsigned depth
+) {
+    if (depth > 128) return false;
+    json_skip_whitespace(json, position);
+    if (position >= json.size()) return false;
+    char c = json[position];
+    if (c == '{') return json_skip_object(json, position, depth);
+    if (c == '[') return json_skip_array(json, position, depth);
+    if (c == '"') return json_skip_string(json, position);
+    if (c == '-' || (c >= '0' && c <= '9'))
+        return json_skip_number(json, position);
+    for (const char *literal : {"true", "false", "null"}) {
+        size_t length = std::strlen(literal);
+        if (json.compare(position, length, literal) == 0) {
+            position += length;
+            return true;
+        }
+    }
+    return false;
+}
+
+inline bool json_root_object_is_valid(const std::string &json) {
+    size_t position = 0;
+    json_skip_whitespace(json, position);
+    if (!json_skip_object(json, position, 0)) return false;
+    json_skip_whitespace(json, position);
+    return position == json.size();
+}
+
+inline bool json_value_has_delimiter(
+    const std::string &json,
+    size_t end_position
+) {
+    while (end_position < json.size() &&
+           (json[end_position] == ' ' || json[end_position] == '\t' ||
+            json[end_position] == '\r' || json[end_position] == '\n')) {
+        end_position++;
+    }
+    if (end_position == json.size()) return true;
+    char delimiter = json[end_position];
+    return delimiter == ',' || delimiter == '}' || delimiter == ']';
+}
+
 // True for a response whose root "result" is an object carrying "status":"OK".
 // Pools in this dialect answer a submit either with `"result":true` or with the
 // same status object they use for login, so both forms must be recognised.
 inline bool json_result_status_ok(const std::string &json) {
+    if (!json_root_object_is_valid(json)) return false;
     size_t position = 0;
     if (!json_find_root_value(json, "result", position)) return false;
+    if (position >= json.size() || json[position] != '{') return false;
     std::string object;
-    if (!json_container_slice(json, position, object)) return false;
+    size_t object_end = 0;
+    if (!json_container_slice(json, position, object, &object_end) ||
+        !json_value_has_delimiter(json, object_end)) {
+        return false;
+    }
 
     size_t status_position = 0;
     if (!json_find_root_value(object, "status", status_position)) return false;
     std::string status;
-    if (!json_string_at(object, status_position, status)) return false;
+    size_t status_end = 0;
+    if (!json_string_at(object, status_position, status, &status_end) ||
+        !json_value_has_delimiter(object, status_end)) {
+        return false;
+    }
     return status.size() == 2 &&
            (status[0] == 'O' || status[0] == 'o') &&
            (status[1] == 'K' || status[1] == 'k');
