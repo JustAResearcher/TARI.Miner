@@ -1148,7 +1148,7 @@ struct solver_ctx {
       return 0;
     }
     if (nedges > MAXEDGES) {
-      print_log("OOPS; losing %d edges beyond MAXEDGES=%d\n", nedges-MAXEDGES, MAXEDGES);
+      fprintf(stderr, "OOPS; losing %d edges beyond MAXEDGES=%d\n", nedges-MAXEDGES, MAXEDGES);
       nedges = MAXEDGES;
     }
 #if TRIM_STAGE_TIMING

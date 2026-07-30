@@ -22,7 +22,11 @@ NVIDIA GPU and selects the correct backend for each card:
 
 Mixed rigs are supported. Each GPU runs in its own process with a worker name
 such as `RIG01-gpu0` or `RIG01-gpu1`. Pipeline depth is also selected inside
-each process from that card's available VRAM.
+each process from the free VRAM remaining after its first solver context starts.
+Automatic selection can use up to five contexts on Linux and Windows TCC, and
+up to four on Windows WDDM. An explicit `--pipeline` value from 1 through 5
+overrides the automatic platform cap; allocation still stops safely if VRAM
+runs out.
 
 The starter does not change GPU clocks, voltage, fans, or power limits.
 
@@ -198,6 +202,35 @@ bin/tari_c29_solver_sm_89 --device 0 --count 320 --pipeline 2
 
 A correct run ends with `verify failures: 0`.
 
+### Exact GPU recall regression
+
+The GPU recall test compares exact `(header nonce, proof hash)` sets, not just
+cycle counts. It independently packs every 42-edge proof, recalculates its
+BLAKE2b-256 hash and difficulty, repeats both builds, and checks pipeline
+parity. Build the shipped and conservative reference profiles for the GPU
+architecture, then run:
+
+```bat
+build_solver.bat sm_120
+build_solver.bat sm_120 reference
+python tests\tari_c29_gpu_recall.py run --candidate bin\tari_c29_solver_sm_120.exe --reference bin\validation\tari_c29_solver_sm_120_reference.exe --arch sm_120 --output-dir validation --parity-pipeline 4
+```
+
+```bash
+./build_solver.sh sm_89
+./build_solver.sh sm_89 reference
+python3 tests/tari_c29_gpu_recall.py run --candidate bin/tari_c29_solver_sm_89 --reference bin/validation/tari_c29_solver_sm_89_reference --arch sm_89 --output-dir validation --parity-pipeline 2
+```
+
+The default sequence tests 4,200 fixed graphs and saves the raw logs, JSONL
+proof records, invoked commands, and comparison report. The reference binaries
+remain under `bin/validation` and are not included in release packages.
+The runner also rejects a binary whose embedded build target, runtime GPU
+architecture, or compiled trim default does not match `--arch`. Throughput
+measurements are a separate performance check and do not replace the exact
+recall gate. Hosted CI compiles both profiles and exercises the verifier
+fixtures; the full sequence runs only on a trusted host with the matching GPU.
+
 ## Build From Source
 
 The repository includes its required third-party source under
@@ -218,8 +251,10 @@ three target architectures:
 ./build_all.sh
 ```
 
-Individual backends can be built with `build_solver` or `build_pool_miner` and
-one of `sm_86`, `sm_89`, or `sm_120`.
+`build_all` also compiles the non-release reference solvers used by the recall
+test. Individual backends can be built with `build_solver` or
+`build_pool_miner` and one of `sm_86`, `sm_89`, or `sm_120`; pass `reference`
+as the second `build_solver` argument to build only that validation profile.
 
 ## License
 

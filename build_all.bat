@@ -7,6 +7,8 @@ for %%A in (sm_86 sm_89 sm_120) do (
   if errorlevel 1 goto failed
   call build_pool_miner.bat %%A
   if errorlevel 1 goto failed
+  call build_solver.bat %%A reference
+  if errorlevel 1 goto failed
 )
 
 echo.

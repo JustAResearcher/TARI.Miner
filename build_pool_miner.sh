@@ -30,7 +30,7 @@ if [[ "$ARCH" == "sm_120" ]]; then
 fi
 
 echo "Building tari_c29_pool_miner_linux for $ARCH ..."
-"$NVCC" "${HOST_FLAGS[@]}" -O3 -std="$STD" --default-stream per-thread -DXBITS="$XBITS" -DIDXSHIFT="$IDXSHIFT" -DGRAPH_UNION_SKIP=1 -DSOLVER_PRELAUNCH_NEXT=1 -DRECOVERY_SMALL_OUTPUT=1 -DSEEDA_REHASH=1 \
+"$NVCC" "${HOST_FLAGS[@]}" -O3 -std="$STD" --default-stream per-thread -DXBITS="$XBITS" -DIDXSHIFT="$IDXSHIFT" -DGRAPH_UNION_SKIP=1 -DRECOVERY_SMALL_OUTPUT=1 -DSEEDA_REHASH=1 \
     "${EXTRA_FLAGS[@]}" \
     -maxrregcount="$MAXRREGCOUNT" -Xptxas -flcm=cg \
     -gencode "arch=$COMPUTE,code=$ARCH" \

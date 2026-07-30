@@ -1,5 +1,6 @@
 // Derived from tromp/cuckoo. SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <stdio.h>
 #include <new>
 
 // compressor for cuckaroo nodes where edgetrimming
@@ -63,7 +64,7 @@ public:
       word_t cu = nodes[ui];
       if (cu == NIL) {
         if (nnodes >= SIZE) {
-          print_log("NODE OVERFLOW at %x\n", u);
+          fprintf(stderr, "NODE OVERFLOW at %x\n", u);
           return 0;
         }
         nodes[ui] = u << SIZEBITS | nnodes;

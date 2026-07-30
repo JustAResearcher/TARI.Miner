@@ -16,7 +16,7 @@ set "CUCKAROO=%ROOT%third_party\cuckoo\src\cuckaroo"
 set "CRYPTO=%ROOT%third_party\cuckoo\src\crypto"
 
 echo Building tari_c29_pool_miner for %ARCH% ...
-"%NVCC%" -O3 -std=c++17 -arch=%ARCH% --default-stream per-thread -DXBITS=7 -DIDXSHIFT=9 -DGRAPH_UNION_SKIP=1 -DSOLVER_PRELAUNCH_NEXT=1 -DRECOVERY_SMALL_OUTPUT=1 -DSEEDA_REHASH=1 %EXTRA_FLAGS% -maxrregcount=96 -Xptxas -flcm=cg ^
+"%NVCC%" -O3 -std=c++17 -arch=%ARCH% --default-stream per-thread -DXBITS=7 -DIDXSHIFT=9 -DGRAPH_UNION_SKIP=1 -DRECOVERY_SMALL_OUTPUT=1 -DSEEDA_REHASH=1 %EXTRA_FLAGS% -maxrregcount=96 -Xptxas -flcm=cg ^
     -I"%ROOT%compat" ^
     -I"%CUCKAROO%" ^
     -I"%CRYPTO%" ^
