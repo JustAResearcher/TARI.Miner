@@ -44,54 +44,115 @@ env:
 
 jobs:
   resolve:
-    name: Resolve tag and version
+    name: Resolve and validate release commit
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       version: ${{ steps.resolve.outputs.version }}
       upload: ${{ steps.resolve.outputs.upload }}
-      # Republished as an output because a job's `container.image` cannot read
-      # the workflow `env`, and both runners must use the same toolkit.
-      cuda: ${{ steps.resolve.outputs.cuda }}
+      sha: ${{ steps.resolve.outputs.sha }}
     steps:
-      # On a tag push this is the pushed tag; on dispatch it is the tag asked
-      # for, which is a required input. The version is the tag without its v,
-      # so package names always match the release they are attached to.
       - id: resolve
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_TAG: ${{ github.ref_name }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+          REQUESTED_UPLOAD: ${{ inputs.upload }}
         run: |
-          tag='${{ inputs.tag || github.ref_name }}'
-          case "$tag" in
-            v*) ;;
-            *)
-              echo "::error::Refusing to build '$tag': release tags start with v."
-              exit 1
-              ;;
-          esac
-          # Checking here turns an unresolvable ref - most often a tag that
-          # exists upstream but was never pushed to this fork - into one clear
-          # message, instead of a bare git failure inside the checkout action.
-          if ! gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1; then
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            tag="$REQUESTED_TAG"
+            upload="$REQUESTED_UPLOAD"
+          else
+            tag="$EVENT_TAG"
+            upload=true
+          fi
+
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Refusing to build '$tag': expected a stable tag such as v1.2.3."
+            exit 1
+          fi
+          if [[ "$upload" != "true" && "$upload" != "false" ]]; then
+            echo "::error::Invalid upload setting '$upload'."
+            exit 1
+          fi
+
+          if ! object_type="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.type' 2>/dev/null)"; then
             echo "::error::$GITHUB_REPOSITORY has no tag $tag. Push it first, for example: git push origin $tag"
             echo "Tags this repository does have:"
             gh api "repos/$GITHUB_REPOSITORY/tags" --jq '.[].name' | head -20
             exit 1
           fi
+          object_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.sha')"
+          while [[ "$object_type" == "tag" ]]; do
+            object_type="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" --jq '.object.type')"
+            object_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" --jq '.object.sha')"
+          done
+          if [[ "$object_type" != "commit" || ! "$object_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::$tag does not resolve to a commit."
+            exit 1
+          fi
+
           version="${tag#v}"
-          upload='${{ github.event_name == 'push' || inputs.upload }}'
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "upload=$upload" >> "$GITHUB_OUTPUT"
-          echo "cuda=$LINUX_CUDA" >> "$GITHUB_OUTPUT"
-          echo "Building $tag (version $version); upload to release: $upload" >> "$GITHUB_STEP_SUMMARY"
+          echo "sha=$object_sha" >> "$GITHUB_OUTPUT"
+          echo "Building $tag at $object_sha (version $version); upload to release: $upload" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ steps.resolve.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release ancestry and version metadata
+        env:
+          EXPECTED_SHA: ${{ steps.resolve.outputs.sha }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          if ! git merge-base --is-ancestor "$EXPECTED_SHA" refs/remotes/origin/main; then
+            echo "::error::$EXPECTED_SHA is not reachable from origin/main."
+            exit 1
+          fi
+
+          declared="$(sed -n 's/^#define TARI_MINER_VERSION "\([^"]*\)"/\1/p' version.h)"
+          if [[ "$declared" != "$VERSION" ]]; then
+            echo "::error::version.h reports '$declared', but the tag reports '$VERSION'."
+            exit 1
+          fi
+          if [[ "$(sed -n 's/^CUSTOM_VERSION=//p' hiveos/h-manifest.conf)" != "$VERSION" ]]; then
+            echo "::error::hiveos/h-manifest.conf does not report version $VERSION."
+            exit 1
+          fi
+          for readme in packaging/README.txt packaging/README-LINUX.txt packaging/README-HIVEOS.txt; do
+            grep -Fq "TARI.Miner C29 v$VERSION" "$readme" || {
+              echo "::error::$readme does not report version $VERSION."
+              exit 1
+            }
+          done
+          grep -Fq "TARI.Miner-v$VERSION-windows.zip" README.md
+          grep -Fq "TARI.Miner-v$VERSION-linux.tar.gz" README.md
+          grep -Fq "tari-miner-hiveos-$VERSION.tar.gz" README.md
+          grep -Fq "/releases/download/v$VERSION/tari-miner-hiveos-$VERSION.tar.gz" packaging/README-HIVEOS.txt
+          for metadata in README.md packaging/README.txt packaging/README-LINUX.txt packaging/README-HIVEOS.txt; do
+            stale="$(grep -Eo 'v[0-9]+\.[0-9]+\.[0-9]+' "$metadata" | sort -u | grep -Fvx "v$VERSION" || true)"
+            if [[ -n "$stale" ]]; then
+              echo "::error::$metadata contains release metadata for a different version: $stale"
+              exit 1
+            fi
+          done
 
   linux:
     name: Build Linux backends
     needs: resolve
     runs-on: ubuntu-latest
     container:
-      image: nvidia/cuda:${{ needs.resolve.outputs.cuda }}-devel-ubuntu22.04
+      image: nvidia/cuda:12.8.0-devel-ubuntu22.04@sha256:54f18e2a8e1b3d03f77b9a6dc905533da46ac93a5513f10e8ba8e560db9fa5ab
     defaults:
       run:
         # Inside a container the default shell is dash, which has no
@@ -105,9 +166,10 @@ jobs:
             --no-install-recommends ca-certificates git
           rm -rf /var/lib/apt/lists/*
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
 
       - name: Build the shipped solver and pool miner for every architecture
         run: |
@@ -137,7 +199,7 @@ jobs:
             done
           done
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-binaries
           path: |
@@ -151,9 +213,10 @@ jobs:
     needs: resolve
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
 
       # Pinned to a commit: this workflow writes to releases, so a moving tag on
       # a third-party action would be a way into the published binaries.
@@ -202,7 +265,7 @@ jobs:
             done
           done
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-binaries
           path: bin/*.exe
@@ -217,16 +280,18 @@ jobs:
       # Only this job writes; the build jobs stay read-only.
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: linux-binaries
           path: linux-bin
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: windows-binaries
           path: windows-bin
@@ -266,11 +331,9 @@ jobs:
             fi
           done
 
-      # Archives are built deterministically - sorted entries, fixed ownership,
-      # the tag's own commit date as the timestamp, and no gzip header time - so
-      # that two runs over identical binaries produce identical archives. The
-      # binaries themselves are whatever nvcc emitted; this makes the packaging
-      # verifiable, not the compilation.
+      # Package byte layout and timestamps are normalized. The binaries
+      # themselves are whatever nvcc emitted, so compilation is not claimed to
+      # be reproducible.
       - name: Build the archives
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
@@ -280,9 +343,10 @@ jobs:
           release="$PWD/dist/release"
           cd dist/staging
 
+          TZ=UTC find "TARI.Miner-v$VERSION-windows" -exec touch -d "@$epoch" {} +
           ( cd "TARI.Miner-v$VERSION-windows" && \
-            zip -rqX "$release/TARI.Miner-v$VERSION-windows.zip" \
-              README.txt start-c29.bat start-c29.ps1 LICENSE THIRD_PARTY_NOTICES.md bin )
+            find . -type f -printf '%P\n' | LC_ALL=C sort | \
+              zip -qX "$release/TARI.Miner-v$VERSION-windows.zip" -@ )
 
           tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \
               -cf - -C "TARI.Miner-v$VERSION-linux" . \
@@ -311,7 +375,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-packages
           path: dist/release/*
@@ -323,19 +387,35 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.resolve.outputs.tag }}
           VERSION: ${{ needs.resolve.outputs.version }}
+          EXPECTED_SHA: ${{ needs.resolve.outputs.sha }}
         run: |
           set -euo pipefail
+          object_type="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.type')"
+          object_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.sha')"
+          while [[ "$object_type" == "tag" ]]; do
+            object_type="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" --jq '.object.type')"
+            object_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" --jq '.object.sha')"
+          done
+          if [[ "$object_type" != "commit" || "$object_sha" != "$EXPECTED_SHA" ]]; then
+            echo "::error::$TAG moved during the build (expected $EXPECTED_SHA, found $object_sha)."
+            exit 1
+          fi
+
           # A tag push usually arrives before the release exists. Create it as a
           # draft rather than publishing: the packages are then attached and
           # reviewable, and announcing them stays a deliberate act.
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Uploading to the existing $TAG release."
+          if release_json="$(gh release view "$TAG" --json isDraft,url 2>/dev/null)"; then
+            if [[ "$(jq -r '.isDraft' <<<"$release_json")" != "true" ]]; then
+              echo "::error::Refusing to overwrite assets on the published $TAG release."
+              exit 1
+            fi
+            echo "Replacing assets on the existing draft $TAG release."
           else
             echo "No $TAG release yet; creating a draft."
             gh release create "$TAG" \
               --draft \
               --verify-tag \
-              --title "TARI.Miner C29 $VERSION" \
+              --title "TARI.Miner C29 v$VERSION" \
               --generate-notes
           fi
           gh release upload "$TAG" \
