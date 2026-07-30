@@ -278,7 +278,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       # Only this job writes; the build jobs stay read-only.
-      contents: write
+      contents: write # Upload packages to the draft release for this tag.
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
