@@ -223,10 +223,114 @@ static void test_socket_state() {
           "concurrent stop preserves socket lifecycle order");
 }
 
+static void test_strict_uint_parsing() {
+    std::puts("Strict unsigned parsing:");
+    uint64_t value = 7;
+    check(tari_pool::json_uint_from("{\"job\":{\"height\":42}}", "height", value) &&
+              value == 42,
+          "a nested unsigned value is read");
+
+    value = 7;
+    check(!tari_pool::json_uint_from("{\"job\":{\"height\":-1}}", "height", value) &&
+              value == 7,
+          "a negative height is rejected rather than wrapping");
+    check(!tari_pool::json_uint_from("{\"job\":{\"height\":+1}}", "height", value),
+          "an explicitly signed height is rejected");
+    check(!tari_pool::json_uint_from("{\"job\":{\"height\":\"12\"}}", "height", value),
+          "a quoted height is not an unsigned value");
+    check(!tari_pool::json_uint_from("{\"job\":{\"height\":12x}}", "height", value),
+          "trailing garbage is rejected");
+    check(!tari_pool::json_root_uint(
+              "{\"id\":4 garbage,\"result\":true}", "id", value),
+          "whitespace followed by garbage is rejected");
+    check(!tari_pool::json_root_uint("{\"id\":04}", "id", value),
+          "a leading-zero integer is rejected");
+    check(!tari_pool::json_uint_from(
+              "{\"job\":{\"height\":99999999999999999999999}}", "height", value),
+          "an overflowing height is rejected");
+
+    value = 0;
+    check(tari_pool::json_uint_from(
+              "{\"job\":{\"height\":18446744073709551615}}", "height", value) &&
+              value == std::numeric_limits<uint64_t>::max(),
+          "the largest unsigned value still parses");
+}
+
+static void test_result_status_ok() {
+    std::puts("Submit result status:");
+    check(tari_pool::json_root_object_is_valid(
+              "{\"id\":4,\"result\":true,\"error\":null}"),
+          "a normal bare-true response is valid JSON");
+    check(!tari_pool::json_root_object_is_valid(
+              "{\"id\":4,,\"result\":true}"),
+          "a malformed bare-true response is invalid JSON");
+    check(!tari_pool::json_root_object_is_valid(
+              "{\"id\":4,\"result\":true garbage}"),
+          "garbage after a bare result is invalid JSON");
+    check(tari_pool::json_result_status_ok(
+              "{\"id\":4,\"result\":{\"status\":\"OK\"},\"error\":null}"),
+          "a status object is recognised as success");
+    check(tari_pool::json_result_status_ok(
+              "{\"id\":4,\"result\":{\"status\":\"ok\"}}"),
+          "status matching is case-insensitive");
+    check(tari_pool::json_result_status_ok(
+              "{\"id\":1,\"result\":{\"id\":\"s\",\"job\":{\"status\":\"NO\"},"
+              "\"status\":\"OK\"}}"),
+          "a nested job object does not hide the root status");
+    check(tari_pool::json_result_status_ok(
+              "{\"meta\":[null,true,false,-1.25e+2],\"result\":{"
+              "\"note\":\"line\\n\\u0041\",\"status\":\"OK\"}}"),
+          "valid JSON values and escapes remain accepted");
+
+    check(!tari_pool::json_result_status_ok(
+              "{\"id\":4,\"result\":{\"status\":\"KO\"}}"),
+          "a non-OK status is not success");
+    check(!tari_pool::json_result_status_ok(
+              "{\"id\":4,\"result\":{\"job\":{\"status\":\"OK\"}}}"),
+          "a status nested below the result is not the result status");
+    check(!tari_pool::json_result_status_ok("{\"id\":4,\"result\":true}"),
+          "a boolean result has no status object");
+    check(!tari_pool::json_result_status_ok(
+              "{\"id\":4,\"error\":{\"status\":\"OK\"}}"),
+          "a status inside an error is not success");
+    check(!tari_pool::json_result_status_ok(
+              "{\"id\":4,\"result\":{\"note\":\"} \\\" {\",\"status\":\"OK\""),
+          "an unterminated result object is not success");
+    check(!tari_pool::json_result_status_ok(
+              "{\"id\":4,\"result\":{\"status\":\"OK\"]}"),
+          "mismatched result delimiters are not success");
+    check(!tari_pool::json_result_status_ok(
+              "{\"id\":4,\"result\":{\"status\":\"OK\"junk}}"),
+          "garbage after the status string is not success");
+    check(!tari_pool::json_result_status_ok(
+              "{\"id\":4,\"result\":{\"status\":\"OK\"}junk}"),
+          "garbage after the result object is not success");
+    check(!tari_pool::json_result_status_ok(
+              "{\"id\":4,\"result\":{\"status\":\"O\\K\"}}"),
+          "an invalid string escape is not success");
+    check(!tari_pool::json_result_status_ok(
+              "{\"id\":4,\"result\":{\"status\":\"OK\"}}junk"),
+          "garbage after the root object is not success");
+    check(!tari_pool::json_result_status_ok(
+              "{\"id\":4,\"result\":{\"status\":\"OK\"}]"),
+          "a mismatched root delimiter is not success");
+    check(!tari_pool::json_result_status_ok(
+              "{\"id\":4,\"result\":{\"note\":\"\\K\",\"status\":\"OK\"}}"),
+          "an invalid escape elsewhere in the response is not success");
+    check(!tari_pool::json_result_status_ok(
+              "{\"id\":4,,\"result\":{\"status\":\"OK\"}}"),
+          "consecutive object commas are not success");
+    check(!tari_pool::json_result_status_ok(
+              "{\"id\":4,\"result\":{\"status\":\"OK\"},}"),
+          "a trailing object comma is not success");
+}
+
 int main() {
     test_target_conversion();
     test_terminal_sanitizing();
     test_json_root_fields();
+    test_strict_uint_parsing();
+    test_result_status_ok();
     test_line_buffer();
     test_socket_state();
     std::printf("\n%s (%d failure%s)\n",

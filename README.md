@@ -184,8 +184,39 @@ TARI_LOGIN_SEPARATOR=/ \
 together: a pool defines both the endpoint and the login format it accepts.
 Passing `--login-separator` after the starter command works as well.
 
+The wallet is checked before the first connection. Whitespace, control
+characters, and inputs larger than the longest supported Tari text encoding are
+rejected outright. A login with one of the two Base58 address lengths that uses
+a `0`, `O`, `I`, or `l` emits a typo warning before mining starts. It is not
+rejected solely for that warning, because pools exist that expect a username
+rather than an address.
+
 The pool connection is plain TCP. Do not use a sensitive password for
 `--pass`; the default `x` is sufficient for LuckyPool.
+
+### Exit Codes
+
+A miner worker keeps running through anything it can recover from, including a
+dropped connection and a pool outage. It exits non-zero only for a condition
+that needs a restart or an operator, so a rig supervisor can act on the code:
+
+| Code | Meaning |
+|------|---------|
+| 0 | Clean shutdown, or `--max-runtime-sec` elapsed |
+| 1 | Startup failure: sockets unavailable, no such CUDA device, or not enough VRAM for one solver |
+| 2 | Invalid command line |
+| 3 | A GPU solution failed host verification; the GPU or its tuning is suspect |
+| 4 | The pool rejected the login repeatedly; check wallet, worker, password, and separator |
+| 5 | Solver failure: a CUDA error, or three consecutive graphs with no surviving edges |
+| 6 | The pool accepted the connection but never sent a job |
+| 7 | The pool repeatedly sent invalid protocol data |
+
+The starters propagate these. When a GPU worker exits non-zero, the starter
+stops the remaining workers and exits with that same code, rather than carrying
+on with its healthy GPUs — otherwise HiveOS never sees the failure. A starter
+that fails before any worker runs uses its own codes: 2 for a missing wallet, 3
+when `nvidia-smi` finds no GPU, 4 when `TARI_DEVICES` matches none, 5 for a
+missing backend binary, and 130 for Ctrl+C.
 
 ## Test The Solver
 

@@ -253,12 +253,7 @@ static bool json_get_string_from(const std::string &line, const char *key, std::
 }
 
 static bool json_get_uint_from(const std::string &line, const char *key, uint64_t &out, size_t start = 0) {
-    size_t p = 0;
-    if (!tari_pool::json_find_value_from(line, key, p, start))
-        return false;
-    char *end = nullptr;
-    out = strtoull(line.c_str() + p, &end, 10);
-    return end && end != line.c_str() + p;
+    return tari_pool::json_uint_from(line, key, out, start);
 }
 
 static uint64_t nonce_prefix_base(const std::string &xn_hex, uint64_t *counter_mask) {
@@ -374,7 +369,7 @@ public:
         return running_.load();
     }
 
-    bool wait_for_job(Job &job, int timeout_ms) {
+    tari_miner::JobWaitOutcome wait_for_job(Job &job, int timeout_ms) {
         double end = now_sec() + timeout_ms / 1000.0;
         uint64_t last = 0;
         while (now_sec() < end) {
@@ -382,14 +377,25 @@ public:
                 std::lock_guard<std::mutex> lk(mu_);
                 if (job_.seq != 0 && job_.seq != last) {
                     job = job_;
-                    return true;
+                    return tari_miner::JobWaitOutcome::Job;
                 }
                 last = job_.seq;
             }
-            if (!alive()) return false;
+            if (login_failed_.load())
+                return tari_miner::JobWaitOutcome::LoginRejected;
+            if (protocol_error_.load())
+                return tari_miner::JobWaitOutcome::ProtocolError;
+            if (!alive())
+                return tari_miner::JobWaitOutcome::Disconnected;
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
-        return false;
+        if (login_failed_.load())
+            return tari_miner::JobWaitOutcome::LoginRejected;
+        if (protocol_error_.load())
+            return tari_miner::JobWaitOutcome::ProtocolError;
+        if (!alive())
+            return tari_miner::JobWaitOutcome::Disconnected;
+        return tari_miner::JobWaitOutcome::Timeout;
     }
 
     Job current_job() {
@@ -433,7 +439,7 @@ public:
 
     uint64_t accepted() const { return accepted_.load(); }
     uint64_t rejected() const { return rejected_.load(); }
-    bool login_failed() const { return login_failed_.load(); }
+    bool protocol_error() const { return protocol_error_.load(); }
 
 private:
     bool send_line(const std::string &line) {
@@ -455,6 +461,7 @@ private:
                 })) {
                 fprintf(stderr, "pool sent a line larger than %zu bytes; disconnecting\n",
                         tari_pool::MAX_LINE_BYTES);
+                protocol_error_.store(true);
                 break;
             }
         }
@@ -462,6 +469,13 @@ private:
     }
 
     void handle_line(const std::string &line) {
+        if (!tari_pool::json_root_object_is_valid(line)) {
+            fprintf(stderr, "pool sent invalid JSON; disconnecting\n");
+            protocol_error_.store(true);
+            running_.store(false);
+            shutdown_socket(socket_.load());
+            return;
+        }
         uint64_t response_id = 0;
         bool has_id = tari_pool::json_root_uint(line, "id", response_id);
         size_t error_position = 0;
@@ -474,6 +488,11 @@ private:
             tari_pool::json_find_root_value(line, "result", result_position);
         bool result_true = tari_pool::json_root_literal(line, "result", "true");
         bool result_false = tari_pool::json_root_literal(line, "result", "false");
+        // Some deployments answer a submit with the same {"status":"OK"} object
+        // they use for login rather than a bare true. Only a response whose id
+        // matches an outstanding submit is counted, so the login reply itself
+        // cannot be mistaken for an accepted share.
+        bool result_status_ok = tari_pool::json_result_status_ok(line);
         tari_miner::PoolResponseKind response;
         {
             std::lock_guard<std::mutex> lk(mu_);
@@ -481,7 +500,7 @@ private:
             response = responses_.classify(
                 has_id, response_id, has_error, has_result,
                 result_true, result_false,
-                login_pending
+                login_pending, result_status_ok
             );
         }
 
@@ -534,6 +553,7 @@ private:
                    (unsigned long long)job_.target_diff, safe_xn.c_str());
         } else if (invalid_target) {
             fprintf(stderr, "invalid pool target; disconnecting\n");
+            protocol_error_.store(true);
             running_.store(false);
             shutdown_socket(socket_.load());
         }
@@ -547,6 +567,7 @@ private:
     tari_miner::PoolResponseTracker responses_;
     std::atomic<bool> running_{false};
     std::atomic<bool> login_failed_{false};
+    std::atomic<bool> protocol_error_{false};
     std::atomic<uint64_t> accepted_{0};
     std::atomic<uint64_t> rejected_{0};
 };
@@ -649,10 +670,27 @@ static bool parse_args(int argc, char **argv, Options &o) {
     }
     tari_miner::WalletValidationError wallet_error =
         tari_miner::validate_wallet(o.wallet);
-    if (wallet_error == tari_miner::WalletValidationError::WhitespaceOrControl) {
-        fprintf(stderr, "--wallet must not contain whitespace or control characters\n");
-        return false;
+    switch (wallet_error) {
+        case tari_miner::WalletValidationError::None:
+            break;
+        case tari_miner::WalletValidationError::Empty:
+            fprintf(stderr, "--wallet is required\n");
+            break;
+        case tari_miner::WalletValidationError::WhitespaceOrControl:
+            fprintf(stderr, "--wallet must not contain whitespace or control characters\n");
+            break;
+        case tari_miner::WalletValidationError::TooLong:
+            fprintf(stderr, "--wallet is %zu bytes; the supported maximum is %zu\n",
+                    o.wallet.size(), tari_miner::MAX_WALLET_LENGTH);
+            break;
+        case tari_miner::WalletValidationError::TariAddressCharset:
+            fprintf(stderr,
+                    "warning: --wallet has a Tari address length but contains a "
+                    "character Base58 never uses (0, O, I or l); check it for a typo\n");
+            break;
     }
+    if (tari_miner::wallet_validation_is_fatal(wallet_error))
+        return false;
     if (o.intensity < 1) o.intensity = 1;
     if (o.intensity > 100) o.intensity = 100;
     if (o.pipeline_set)
@@ -753,6 +791,8 @@ int main(int argc, char **argv) {
     uint64_t graphs = 0, cycles = 0, submitted = 0, verify_failures = 0;
     int exit_code = 0;
     tari_miner::LoginFailurePolicy login_failures;
+    tari_miner::PoolSilencePolicy pool_silence;
+    tari_miner::ProtocolErrorPolicy protocol_errors;
     std::vector<tari_miner::SolverWatchdog> solver_watchdogs(contexts.size());
     double start = now_sec();
     double last_report = start;
@@ -769,6 +809,22 @@ int main(int argc, char **argv) {
         return false;
     };
 
+    auto record_protocol_error = [&]() {
+        bool fatal = protocol_errors.record_failure();
+        if (fatal) {
+            fprintf(stderr,
+                    "pool sent invalid protocol data %u times; exiting "
+                    "for operator review\n",
+                    protocol_errors.consecutive_failures());
+            exit_code = tari_miner::POOL_PROTOCOL_EXIT_CODE;
+            return true;
+        }
+        fprintf(stderr, "pool protocol error (%u/%u); retrying in 5s\n",
+                protocol_errors.consecutive_failures(),
+                tari_miner::MAX_PROTOCOL_ERRORS);
+        return false;
+    };
+
     while (true) {
         double elapsed = now_sec() - start;
         if (opt.max_runtime_sec > 0 && elapsed >= opt.max_runtime_sec) break;
@@ -778,15 +834,21 @@ int main(int argc, char **argv) {
 
         PoolClient pool;
         if (!pool.connect_login(opt.pool, login, opt.pass)) {
+            pool_silence.reset();
+            protocol_errors.reset();
             fprintf(stderr, "pool connection/login send failed; retrying in 5s\n");
             std::this_thread::sleep_for(std::chrono::seconds(5));
             continue;
         }
 
         Job job;
-        if (!pool.wait_for_job(job, 20000)) {
-            if (pool.login_failed()) {
+        tari_miner::JobWaitOutcome wait_outcome =
+            pool.wait_for_job(job, 20000);
+        if (wait_outcome != tari_miner::JobWaitOutcome::Job) {
+            if (wait_outcome == tari_miner::JobWaitOutcome::LoginRejected) {
                 pool.stop();
+                pool_silence.reset();
+                protocol_errors.reset();
                 bool fatal = login_failures.record_failure();
                 if (fatal) {
                     fprintf(stderr,
@@ -804,10 +866,44 @@ int main(int argc, char **argv) {
                     std::chrono::seconds(tari_miner::LOGIN_RETRY_SECONDS));
                 continue;
             }
-            fprintf(stderr, "no job received; reconnecting\n");
+            pool.stop();
+            if (tari_miner::counts_as_pool_silence(wait_outcome)) {
+                protocol_errors.reset();
+                // The connection stayed open but sent no job and no error, so
+                // there is nothing for the login policy to count. Back off, and
+                // give up eventually rather than reconnecting forever in silence.
+                bool silent_fatal = pool_silence.record_silence();
+                if (silent_fatal) {
+                    fprintf(stderr,
+                            "no job received from %s after %u attempts; exiting for "
+                            "supervisor restart\n",
+                            opt.pool.c_str(), pool_silence.consecutive_silences());
+                    exit_code = tari_miner::POOL_SILENT_EXIT_CODE;
+                    break;
+                }
+                unsigned backoff = pool_silence.backoff_seconds();
+                fprintf(stderr, "no job received (%u/%u); reconnecting in %us\n",
+                        pool_silence.consecutive_silences(),
+                        tari_miner::MAX_SILENT_CYCLES, backoff);
+                std::this_thread::sleep_for(std::chrono::seconds(backoff));
+                continue;
+            }
+            pool_silence.reset();
+            if (wait_outcome == tari_miner::JobWaitOutcome::ProtocolError) {
+                if (record_protocol_error())
+                    break;
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                continue;
+            }
+            protocol_errors.reset();
+            fprintf(stderr,
+                    "pool disconnected before the first valid job; retrying in 5s\n");
+            std::this_thread::sleep_for(std::chrono::seconds(5));
             continue;
         }
         login_failures.record_success();
+        pool_silence.record_job();
+        protocol_errors.record_valid_job(job.seq);
 
         uint64_t last_seq = 0;
         uint64_t base = 0, mask = ~0ULL, counter = 0;
@@ -897,6 +993,11 @@ int main(int argc, char **argv) {
                 continue;
             }
             if (job.seq != last_seq) {
+                // Do not reset on the initial job: a pool that sends one valid
+                // job and then malformed updates on every reconnect must still
+                // reach the protocol-error limit. A later valid update proves
+                // the connection has recovered and breaks that streak.
+                protocol_errors.record_valid_job(job.seq);
                 last_seq = job.seq;
                 base = nonce_prefix_base(job.xn_hex, &mask);
                 counter = ((uint64_t)(now_sec() * 1000000.0)) & mask;
@@ -940,6 +1041,7 @@ int main(int argc, char **argv) {
                 Job launch_job = pool.current_job();
                 if (launch_job.seq == 0) return false;
                 if (launch_job.seq != last_seq) {
+                    protocol_errors.record_valid_job(launch_job.seq);
                     last_seq = launch_job.seq;
                     base = nonce_prefix_base(launch_job.xn_hex, &mask);
                     counter = ((uint64_t)(now_sec() * 1000000.0)) & mask;
@@ -1022,6 +1124,21 @@ int main(int argc, char **argv) {
         }
         if (exit_code)
             break;
+        if (pool.protocol_error()) {
+            pool.stop();
+            // The reader can parse a valid update and malformed data in the
+            // same receive batch before the mining loop observes that update.
+            // Consult the synchronized final job state before counting the
+            // protocol failure so recovery does not depend on thread timing.
+            protocol_errors.record_valid_job(pool.current_job().seq);
+            if (record_protocol_error())
+                break;
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            continue;
+        }
+        // A connection that ends without malformed data also breaks the
+        // protocol-error streak.
+        protocol_errors.reset();
     }
 
     double elapsed = now_sec() - start;
