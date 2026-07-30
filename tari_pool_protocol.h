@@ -158,14 +158,15 @@ inline bool json_root_literal(
            delimiter == '\r' || delimiter == '\n';
 }
 
-inline bool json_root_uint(
+// Strict unsigned parse at an already-located value position. Rejects a sign,
+// leading whitespace, and anything that does not terminate on a JSON
+// delimiter, so "-1" cannot arrive as a huge unsigned value.
+inline bool parse_uint_at(
     const std::string &json,
-    const char *key,
+    size_t position,
     uint64_t &value
 ) {
-    size_t position = 0;
-    if (!json_find_root_value(json, key, position) ||
-        position == json.size() ||
+    if (position >= json.size() ||
         json[position] < '0' || json[position] > '9') {
         return false;
     }
@@ -188,6 +189,109 @@ inline bool json_root_uint(
     }
     value = parsed;
     return true;
+}
+
+inline bool json_root_uint(
+    const std::string &json,
+    const char *key,
+    uint64_t &value
+) {
+    size_t position = 0;
+    if (!json_find_root_value(json, key, position)) return false;
+    return parse_uint_at(json, position, value);
+}
+
+inline bool json_uint_from(
+    const std::string &json,
+    const char *key,
+    uint64_t &value,
+    size_t start = 0
+) {
+    size_t position = 0;
+    if (!json_find_value_from(json, key, position, start)) return false;
+    return parse_uint_at(json, position, value);
+}
+
+// Read the quoted string that begins at `position`.
+inline bool json_string_at(
+    const std::string &json,
+    size_t position,
+    std::string &out
+) {
+    if (position >= json.size() || json[position] != '"') return false;
+    std::string value;
+    bool escaped = false;
+    for (size_t i = position + 1; i < json.size(); ++i) {
+        char c = json[i];
+        if (escaped) {
+            value.push_back(c);
+            escaped = false;
+        } else if (c == '\\') {
+            escaped = true;
+        } else if (c == '"') {
+            out = value;
+            return true;
+        } else {
+            value.push_back(c);
+        }
+    }
+    return false;
+}
+
+// Extract the balanced object or array beginning at `position`, skipping over
+// braces that appear inside strings.
+inline bool json_container_slice(
+    const std::string &json,
+    size_t position,
+    std::string &out
+) {
+    if (position >= json.size() ||
+        (json[position] != '{' && json[position] != '[')) {
+        return false;
+    }
+
+    size_t depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (size_t i = position; i < json.size(); ++i) {
+        char c = json[i];
+        if (in_string) {
+            if (escaped) escaped = false;
+            else if (c == '\\') escaped = true;
+            else if (c == '"') in_string = false;
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+        } else if (c == '{' || c == '[') {
+            depth++;
+        } else if (c == '}' || c == ']') {
+            depth--;
+            if (depth == 0) {
+                out = json.substr(position, i - position + 1);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// True for a response whose root "result" is an object carrying "status":"OK".
+// Pools in this dialect answer a submit either with `"result":true` or with the
+// same status object they use for login, so both forms must be recognised.
+inline bool json_result_status_ok(const std::string &json) {
+    size_t position = 0;
+    if (!json_find_root_value(json, "result", position)) return false;
+    std::string object;
+    if (!json_container_slice(json, position, object)) return false;
+
+    size_t status_position = 0;
+    if (!json_find_root_value(object, "status", status_position)) return false;
+    std::string status;
+    if (!json_string_at(object, status_position, status)) return false;
+    return status.size() == 2 &&
+           (status[0] == 'O' || status[0] == 'o') &&
+           (status[1] == 'K' || status[1] == 'k');
 }
 
 class LineBuffer {

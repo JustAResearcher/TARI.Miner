@@ -4,8 +4,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <set>
 #include <string>
-#include <unordered_set>
 
 namespace tari_miner {
 
@@ -33,11 +33,18 @@ enum class PoolResponseKind {
 constexpr uint64_t LOGIN_REQUEST_ID = 1;
 constexpr uint64_t FIRST_SUBMIT_REQUEST_ID = 4;
 
+// A pool that never answers a submit would otherwise grow the pending set for
+// as long as the miner runs. Beyond this many outstanding submits the oldest
+// is forgotten; it can then only be classified as an unmatched response.
+constexpr size_t MAX_PENDING_SUBMITS = 256;
+
 class PoolResponseTracker {
 public:
     uint64_t begin_submit() {
         uint64_t id = next_submit_id_++;
         pending_submits_.insert(id);
+        while (pending_submits_.size() > MAX_PENDING_SUBMITS)
+            pending_submits_.erase(pending_submits_.begin());
         return id;
     }
 
@@ -52,7 +59,8 @@ public:
         bool has_result,
         bool result_true,
         bool result_false,
-        bool login_pending
+        bool login_pending,
+        bool result_status_ok = false
     ) {
         if ((has_error || result_false) && login_pending &&
             ((!has_id) || id == LOGIN_REQUEST_ID))
@@ -66,7 +74,7 @@ public:
             if (has_error || result_false) {
                 return PoolResponseKind::ShareRejected;
             }
-            if (result_true) {
+            if (result_true || result_status_ok) {
                 return PoolResponseKind::ShareAccepted;
             }
             return PoolResponseKind::Other;
@@ -82,7 +90,8 @@ public:
 
 private:
     uint64_t next_submit_id_ = FIRST_SUBMIT_REQUEST_ID;
-    std::unordered_set<uint64_t> pending_submits_;
+    // Ordered so the oldest outstanding submit is the one dropped at the cap.
+    std::set<uint64_t> pending_submits_;
 };
 
 constexpr unsigned MAX_LOGIN_FAILURES = 3;
@@ -106,6 +115,47 @@ public:
 
 private:
     unsigned consecutive_failures_ = 0;
+};
+
+// A pool that accepts the connection but never sends a job produces no error to
+// count, so the login policy above never fires. Bound that case separately:
+// back off between attempts, then exit so a supervisor can react.
+constexpr unsigned MAX_SILENT_CYCLES = 10;
+constexpr int POOL_SILENT_EXIT_CODE = 6;
+constexpr unsigned FIRST_SILENT_BACKOFF_SECONDS = 5;
+constexpr unsigned MAX_SILENT_BACKOFF_SECONDS = 60;
+
+class PoolSilencePolicy {
+public:
+    // Returns true when the miner should stop retrying.
+    bool record_silence() {
+        consecutive_silences_++;
+        return consecutive_silences_ >= MAX_SILENT_CYCLES;
+    }
+
+    void record_job() {
+        consecutive_silences_ = 0;
+    }
+
+    unsigned consecutive_silences() const {
+        return consecutive_silences_;
+    }
+
+    // Doubling backoff, capped, so a pool outage is not hammered.
+    unsigned backoff_seconds() const {
+        unsigned seconds = FIRST_SILENT_BACKOFF_SECONDS;
+        for (unsigned i = 1; i < consecutive_silences_; ++i) {
+            if (seconds >= MAX_SILENT_BACKOFF_SECONDS)
+                return MAX_SILENT_BACKOFF_SECONDS;
+            seconds *= 2;
+        }
+        return seconds < MAX_SILENT_BACKOFF_SECONDS
+            ? seconds
+            : MAX_SILENT_BACKOFF_SECONDS;
+    }
+
+private:
+    unsigned consecutive_silences_ = 0;
 };
 
 constexpr unsigned MAX_CONSECUTIVE_ZERO_YIELDS = 3;

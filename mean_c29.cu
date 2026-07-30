@@ -1077,25 +1077,42 @@ struct solver_ctx {
         // print_log(" (%x, %x)", soledges[j].x, soledges[j].y);
       }
       // print_log("\n");
-      outSols.resize(outSols.size() + PROOFSIZE);
-      checkCudaErrors(cudaMemcpyToSymbol(recoveredges, soledges, sizeof(soledges)));
+      // Recovery fills this slot. On failure it is removed again, so a caller
+      // never sees a half-written proof of zeros that would then be reported as
+      // a verification failure.
+      const size_t solbase = outSols.size();
+      outSols.resize(solbase + PROOFSIZE);
+      cudaError_t rc = cudaMemcpyToSymbol(recoveredges, soledges, sizeof(soledges));
 #if RECOVERY_SMALL_OUTPUT
-      checkCudaErrors(cudaMemset(recoverIndexes, 0, PROOFSIZE * sizeof(u32)));
-      Recovery<<<trimmer.tp.recover.blocks, trimmer.tp.recover.tpb>>>(keys, (ulonglong4*)trimmer.bufferA, (int *)recoverIndexes);
-      checkCudaErrors(cudaGetLastError());
-      checkCudaErrors(cudaMemcpy(&outSols[outSols.size()-PROOFSIZE], recoverIndexes,
-                                 PROOFSIZE * sizeof(u32), cudaMemcpyDeviceToHost));
+      if (rc == cudaSuccess)
+        rc = cudaMemset(recoverIndexes, 0, PROOFSIZE * sizeof(u32));
+      if (rc == cudaSuccess) {
+        Recovery<<<trimmer.tp.recover.blocks, trimmer.tp.recover.tpb>>>(keys, (ulonglong4*)trimmer.bufferA, (int *)recoverIndexes);
+        rc = cudaGetLastError();
+      }
+      if (rc == cudaSuccess)
+        rc = cudaMemcpy(&outSols[solbase], recoverIndexes,
+                        PROOFSIZE * sizeof(u32), cudaMemcpyDeviceToHost);
 #else
-      checkCudaErrors(cudaMemset(trimmer.indexesE[1], 0, trimmer.indexesSize));
-      Recovery<<<trimmer.tp.recover.blocks, trimmer.tp.recover.tpb>>>(keys, (ulonglong4*)trimmer.bufferA, (int *)trimmer.indexesE[1]);
-      checkCudaErrors(cudaGetLastError());
-      checkCudaErrors(cudaMemcpy(&outSols[outSols.size()-PROOFSIZE], trimmer.indexesE[1],
-                                 PROOFSIZE * sizeof(u32), cudaMemcpyDeviceToHost));
+      if (rc == cudaSuccess)
+        rc = cudaMemset(trimmer.indexesE[1], 0, trimmer.indexesSize);
+      if (rc == cudaSuccess) {
+        Recovery<<<trimmer.tp.recover.blocks, trimmer.tp.recover.tpb>>>(keys, (ulonglong4*)trimmer.bufferA, (int *)trimmer.indexesE[1]);
+        rc = cudaGetLastError();
+      }
+      if (rc == cudaSuccess)
+        rc = cudaMemcpy(&outSols[solbase], trimmer.indexesE[1],
+                        PROOFSIZE * sizeof(u32), cudaMemcpyDeviceToHost);
 #endif
       // Recovery uses the calling thread's default stream. Synchronizing that
       // stream preserves overlap with trims running in other host threads.
-      checkCudaErrors(cudaStreamSynchronize(0));
-      qsort(&outSols[outSols.size()-PROOFSIZE], PROOFSIZE, sizeof(u32), cg.nonce_cmp);
+      if (rc == cudaSuccess)
+        rc = cudaStreamSynchronize(0);
+      if (rc != cudaSuccess) {
+        outSols.resize(solbase);
+        return gpuAssert(rc, __FILE__, __LINE__);
+      }
+      qsort(&outSols[solbase], PROOFSIZE, sizeof(u32), cg.nonce_cmp);
     }
     return 0;
   }

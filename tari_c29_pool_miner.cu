@@ -253,12 +253,7 @@ static bool json_get_string_from(const std::string &line, const char *key, std::
 }
 
 static bool json_get_uint_from(const std::string &line, const char *key, uint64_t &out, size_t start = 0) {
-    size_t p = 0;
-    if (!tari_pool::json_find_value_from(line, key, p, start))
-        return false;
-    char *end = nullptr;
-    out = strtoull(line.c_str() + p, &end, 10);
-    return end && end != line.c_str() + p;
+    return tari_pool::json_uint_from(line, key, out, start);
 }
 
 static uint64_t nonce_prefix_base(const std::string &xn_hex, uint64_t *counter_mask) {
@@ -474,6 +469,11 @@ private:
             tari_pool::json_find_root_value(line, "result", result_position);
         bool result_true = tari_pool::json_root_literal(line, "result", "true");
         bool result_false = tari_pool::json_root_literal(line, "result", "false");
+        // Some deployments answer a submit with the same {"status":"OK"} object
+        // they use for login rather than a bare true. Only a response whose id
+        // matches an outstanding submit is counted, so the login reply itself
+        // cannot be mistaken for an accepted share.
+        bool result_status_ok = tari_pool::json_result_status_ok(line);
         tari_miner::PoolResponseKind response;
         {
             std::lock_guard<std::mutex> lk(mu_);
@@ -481,7 +481,7 @@ private:
             response = responses_.classify(
                 has_id, response_id, has_error, has_result,
                 result_true, result_false,
-                login_pending
+                login_pending, result_status_ok
             );
         }
 
@@ -753,6 +753,7 @@ int main(int argc, char **argv) {
     uint64_t graphs = 0, cycles = 0, submitted = 0, verify_failures = 0;
     int exit_code = 0;
     tari_miner::LoginFailurePolicy login_failures;
+    tari_miner::PoolSilencePolicy pool_silence;
     std::vector<tari_miner::SolverWatchdog> solver_watchdogs(contexts.size());
     double start = now_sec();
     double last_report = start;
@@ -804,10 +805,28 @@ int main(int argc, char **argv) {
                     std::chrono::seconds(tari_miner::LOGIN_RETRY_SECONDS));
                 continue;
             }
-            fprintf(stderr, "no job received; reconnecting\n");
+            // The pool accepted the connection but sent no job and no error, so
+            // there is nothing for the login policy to count. Back off, and give
+            // up eventually rather than reconnecting forever in silence.
+            pool.stop();
+            bool silent_fatal = pool_silence.record_silence();
+            if (silent_fatal) {
+                fprintf(stderr,
+                        "no job received from %s after %u attempts; exiting for "
+                        "supervisor restart\n",
+                        opt.pool.c_str(), pool_silence.consecutive_silences());
+                exit_code = tari_miner::POOL_SILENT_EXIT_CODE;
+                break;
+            }
+            unsigned backoff = pool_silence.backoff_seconds();
+            fprintf(stderr, "no job received (%u/%u); reconnecting in %us\n",
+                    pool_silence.consecutive_silences(),
+                    tari_miner::MAX_SILENT_CYCLES, backoff);
+            std::this_thread::sleep_for(std::chrono::seconds(backoff));
             continue;
         }
         login_failures.record_success();
+        pool_silence.record_job();
 
         uint64_t last_seq = 0;
         uint64_t base = 0, mask = ~0ULL, counter = 0;

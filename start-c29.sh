@@ -121,17 +121,54 @@ if [[ "${TARI_DRY_RUN:-0}" == "1" ]]; then
     exit 0
 fi
 
+kill_workers() {
+    if ((${#pids[@]} > 0)); then
+        kill "${pids[@]}" 2>/dev/null || true
+        wait "${pids[@]}" 2>/dev/null || true
+    fi
+}
+
 stop_workers() {
     trap - INT TERM
-    kill "${pids[@]}" 2>/dev/null || true
-    wait "${pids[@]}" 2>/dev/null || true
+    kill_workers
     exit 130
 }
 trap stop_workers INT TERM
 
 status=0
 ((missing == 0)) || status=1
-for pid in "${pids[@]}"; do
-    wait "$pid" || status=1
+
+# A miner worker exits non-zero when it hits something only a restart can clear:
+# a repeatedly rejected login (4), a failed solver (5), an unresponsive pool (6).
+# Stop the surviving workers and exit with that code, so a rig supervisor sees
+# the failure instead of a launcher that keeps running its healthy GPUs.
+worker_failure=0
+while ((${#pids[@]} > 0)); do
+    remaining=()
+    for pid in "${pids[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            remaining+=("$pid")
+            continue
+        fi
+        worker_status=0
+        wait "$pid" || worker_status=$?
+        if ((worker_status != 0)) && ((worker_failure == 0)); then
+            echo "ERROR: GPU worker $pid exited with code $worker_status." >&2
+            worker_failure="$worker_status"
+        fi
+    done
+    pids=(${remaining[@]+"${remaining[@]}"})
+    ((worker_failure == 0)) || break
+    ((${#pids[@]} > 0)) || break
+    sleep 1
 done
+
+if ((worker_failure != 0)); then
+    if ((${#pids[@]} > 0)); then
+        echo "Stopping ${#pids[@]} remaining GPU worker(s)." >&2
+        kill_workers
+    fi
+    exit "$worker_failure"
+fi
+
 exit "$status"

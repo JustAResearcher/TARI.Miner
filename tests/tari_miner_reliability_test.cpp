@@ -116,6 +116,78 @@ static void test_pool_response_classification() {
           "an unrelated pool error is not counted as a share reject");
 }
 
+static void test_pending_submit_bound() {
+    std::puts("Pending submit bound:");
+    tari_miner::PoolResponseTracker tracker;
+    uint64_t first = tracker.begin_submit();
+    for (size_t i = 1; i < tari_miner::MAX_PENDING_SUBMITS; ++i)
+        tracker.begin_submit();
+    check(tracker.pending_submits() == tari_miner::MAX_PENDING_SUBMITS,
+          "the tracker fills to its bound");
+
+    uint64_t newest = tracker.begin_submit();
+    check(tracker.pending_submits() == tari_miner::MAX_PENDING_SUBMITS,
+          "a silent pool cannot grow the pending set without limit");
+    check(tracker.classify(true, first, false, true, true, false, false) ==
+              tari_miner::PoolResponseKind::Other,
+          "the oldest submit is the one forgotten at the bound");
+    check(tracker.classify(true, newest, false, true, true, false, false) ==
+              tari_miner::PoolResponseKind::ShareAccepted,
+          "the newest submit is still tracked");
+}
+
+static void test_status_ok_acceptance() {
+    std::puts("Status-object share acceptance:");
+    using tari_miner::PoolResponseKind;
+    tari_miner::PoolResponseTracker tracker;
+    uint64_t submit = tracker.begin_submit();
+    check(tracker.classify(true, submit, false, true, false, false, false, true) ==
+              PoolResponseKind::ShareAccepted,
+          "a submit answered with a status object counts as accepted");
+
+    tari_miner::PoolResponseTracker login_tracker;
+    check(login_tracker.classify(
+              true, tari_miner::LOGIN_REQUEST_ID, false, true, false, false,
+              true, true) == PoolResponseKind::Other,
+          "the login status object is not counted as an accepted share");
+
+    uint64_t rejected = tracker.begin_submit();
+    check(tracker.classify(true, rejected, true, true, false, false, false, true) ==
+              PoolResponseKind::ShareRejected,
+          "an error outranks a status object on the same response");
+}
+
+static void test_pool_silence_policy() {
+    std::puts("Pool silence policy:");
+    check(tari_miner::POOL_SILENT_EXIT_CODE == 6,
+          "an unresponsive pool uses exit code 6");
+    tari_miner::PoolSilencePolicy policy;
+    check(!policy.record_silence() && policy.consecutive_silences() == 1,
+          "the first silent connection retries");
+    check(policy.backoff_seconds() == tari_miner::FIRST_SILENT_BACKOFF_SECONDS,
+          "the first retry uses the base backoff");
+    check(!policy.record_silence() &&
+              policy.backoff_seconds() ==
+                  tari_miner::FIRST_SILENT_BACKOFF_SECONDS * 2,
+          "the backoff doubles");
+
+    for (unsigned i = 0; i < 6; ++i) policy.record_silence();
+    check(policy.backoff_seconds() == tari_miner::MAX_SILENT_BACKOFF_SECONDS,
+          "the backoff is capped");
+
+    policy.record_job();
+    check(policy.consecutive_silences() == 0 &&
+              policy.backoff_seconds() ==
+                  tari_miner::FIRST_SILENT_BACKOFF_SECONDS,
+          "a received job resets the policy");
+
+    tari_miner::PoolSilencePolicy fatal_policy;
+    bool fatal = false;
+    for (unsigned i = 0; i < tari_miner::MAX_SILENT_CYCLES; ++i)
+        fatal = fatal_policy.record_silence();
+    check(fatal, "a persistently silent pool eventually exits");
+}
+
 static void test_login_failure_policy() {
     std::puts("Login failure policy:");
     check(tari_miner::LOGIN_FAILURE_EXIT_CODE == 4,
@@ -173,6 +245,9 @@ static void test_solver_watchdog() {
 int main() {
     test_wallet_validation();
     test_pool_response_classification();
+    test_pending_submit_bound();
+    test_status_ok_acceptance();
+    test_pool_silence_policy();
     test_login_failure_policy();
     test_solver_watchdog();
     std::printf("\n%s (%d failure%s)\n",

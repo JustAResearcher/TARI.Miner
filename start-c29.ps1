@@ -121,6 +121,7 @@ if (-not [string]::IsNullOrEmpty($logDir) -and -not (Test-Path -LiteralPath $log
 
 $workers = @()
 $workerFailed = $false
+$workerExitCode = 0
 try {
     foreach ($item in $plan) {
         $startArgs = @{
@@ -151,19 +152,31 @@ try {
     }
     Write-Host 'Press Ctrl+C to stop all GPU workers.'
 
+    # A worker exits non-zero only for something a restart must clear: a
+    # repeatedly rejected login (4), a failed solver (5), an unresponsive pool
+    # (6). Stop the survivors and surface that code, so a rig supervisor sees the
+    # failure instead of a launcher still babysitting its healthy GPUs.
     while ($true) {
-        $alive = @($workers | Where-Object { -not $_.HasExited })
-        if ($alive.Count -eq 0) { break }
-        Start-Sleep -Seconds 2
-    }
-    Write-Host 'All GPU workers have exited.'
-    foreach ($worker in $workers) {
-        $worker.WaitForExit()
-        $exitCode = $worker.ExitCode
-        if ($exitCode -ne 0) {
-            Write-Host "ERROR: Miner worker PID $($worker.Id) exited with code $exitCode."
-            $workerFailed = $true
+        $exited = @($workers | Where-Object { $_.HasExited })
+        foreach ($worker in $exited) {
+            if ($worker.ExitCode -ne 0 -and $workerExitCode -eq 0) {
+                Write-Host "ERROR: Miner worker PID $($worker.Id) exited with code $($worker.ExitCode)."
+                $workerExitCode = $worker.ExitCode
+                $workerFailed = $true
+            }
         }
+        if ($workerFailed) {
+            $alive = @($workers | Where-Object { -not $_.HasExited })
+            if ($alive.Count -gt 0) {
+                Write-Host "Stopping $($alive.Count) remaining GPU worker(s)."
+            }
+            break
+        }
+        if ($exited.Count -eq $workers.Count) {
+            Write-Host 'All GPU workers have exited.'
+            break
+        }
+        Start-Sleep -Seconds 2
     }
 }
 catch {
@@ -179,6 +192,9 @@ finally {
     }
 }
 
+if ($workerFailed) {
+    if ($workerExitCode -ne 0) { exit $workerExitCode }
+    exit 1
+}
 if ($missing -gt 0) { exit 5 }
-if ($workerFailed) { exit 1 }
 exit 0
