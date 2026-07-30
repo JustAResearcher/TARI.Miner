@@ -184,6 +184,15 @@ TARI_LOGIN_SEPARATOR=/ \
 together: a pool defines both the endpoint and the login format it accepts.
 Passing `--login-separator` after the starter command works as well.
 
+The wallet is checked before the first connection. Whitespace, control
+characters, and anything longer than the longest possible Tari address are
+rejected outright. Beyond that, a login that is already shaped like a Tari
+address — one of the two Base58 address lengths, and nothing but letters and
+digits — must use only Base58 characters, so a `0`, `O`, `I`, or `l` from a
+mistyped or misread address is caught before mining starts. Logins of any other
+shape are passed through untouched, because pools exist that expect a username
+rather than an address.
+
 The pool connection is plain TCP. Do not use a sensitive password for
 `--pass`; the default `x` is sufficient for LuckyPool.
 

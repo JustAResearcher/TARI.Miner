@@ -647,11 +647,24 @@ static bool parse_args(int argc, char **argv, Options &o) {
         fprintf(stderr, "--wallet is required\n");
         return false;
     }
-    tari_miner::WalletValidationError wallet_error =
-        tari_miner::validate_wallet(o.wallet);
-    if (wallet_error == tari_miner::WalletValidationError::WhitespaceOrControl) {
-        fprintf(stderr, "--wallet must not contain whitespace or control characters\n");
-        return false;
+    switch (tari_miner::validate_wallet(o.wallet)) {
+        case tari_miner::WalletValidationError::None:
+            break;
+        case tari_miner::WalletValidationError::Empty:
+            fprintf(stderr, "--wallet is required\n");
+            return false;
+        case tari_miner::WalletValidationError::WhitespaceOrControl:
+            fprintf(stderr, "--wallet must not contain whitespace or control characters\n");
+            return false;
+        case tari_miner::WalletValidationError::TooLong:
+            fprintf(stderr, "--wallet is %zu characters; no Tari address is longer than %zu\n",
+                    o.wallet.size(), tari_miner::MAX_WALLET_LENGTH);
+            return false;
+        case tari_miner::WalletValidationError::TariAddressCharset:
+            fprintf(stderr,
+                    "--wallet looks like a Tari address but contains a character that "
+                    "Base58 never uses (0, O, I or l); check it for a typo\n");
+            return false;
     }
     if (o.intensity < 1) o.intensity = 1;
     if (o.intensity > 100) o.intensity = 100;

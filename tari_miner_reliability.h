@@ -11,13 +11,79 @@ namespace tari_miner {
 
 enum class WalletValidationError {
     None,
+    Empty,
     WhitespaceOrControl,
+    TooLong,
+    TariAddressCharset,
 };
 
+// Base58 lengths a Tari address can have, from the consensus source at
+// base_layer/common_types/src/tari_address/mod.rs: a single address encodes to
+// 45-48 characters, a dual address to 89-443 (the upper bound covers the
+// payment-id field).
+constexpr size_t TARI_SINGLE_ADDRESS_MIN_LENGTH = 45;
+constexpr size_t TARI_SINGLE_ADDRESS_MAX_LENGTH = 48;
+constexpr size_t TARI_DUAL_ADDRESS_MIN_LENGTH = 89;
+constexpr size_t TARI_DUAL_ADDRESS_MAX_LENGTH = 443;
+constexpr size_t MAX_WALLET_LENGTH = TARI_DUAL_ADDRESS_MAX_LENGTH;
+
+// Bitcoin base58: the digits and letters, minus 0 O I l. Those four are exactly
+// the characters a mistyped or OCR-read address tends to gain.
+inline bool is_base58_char(unsigned char c) {
+    if (c >= '1' && c <= '9') return true;
+    if (c >= 'a' && c <= 'z') return c != 'l';
+    if (c >= 'A' && c <= 'Z') return c != 'I' && c != 'O';
+    return false;
+}
+
+inline bool has_tari_address_length(size_t length) {
+    return (length >= TARI_SINGLE_ADDRESS_MIN_LENGTH &&
+            length <= TARI_SINGLE_ADDRESS_MAX_LENGTH) ||
+           (length >= TARI_DUAL_ADDRESS_MIN_LENGTH &&
+            length <= TARI_DUAL_ADDRESS_MAX_LENGTH);
+}
+
+inline bool is_ascii_alnum(unsigned char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z');
+}
+
+inline bool is_hex_string(const std::string &text) {
+    for (unsigned char c : text) {
+        bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                   (c >= 'A' && c <= 'F');
+        if (!hex) return false;
+    }
+    return true;
+}
+
+// This field is not always a Tari address: pools exist that expect a username,
+// which is why --login-separator exists. So the charset rule is applied only to
+// strings already shaped like an address - the length of one, and nothing but
+// ASCII letters and digits. Anything else is passed through, and it is the pool
+// that decides whether the login is good.
 inline WalletValidationError validate_wallet(const std::string &wallet) {
+    if (wallet.empty()) return WalletValidationError::Empty;
+
     for (unsigned char c : wallet) {
         if (c <= 0x20 || c == 0x7f)
             return WalletValidationError::WhitespaceOrControl;
+    }
+    if (wallet.size() > MAX_WALLET_LENGTH)
+        return WalletValidationError::TooLong;
+
+    if (!has_tari_address_length(wallet.size()))
+        return WalletValidationError::None;
+    for (unsigned char c : wallet) {
+        if (!is_ascii_alnum(c)) return WalletValidationError::None;
+    }
+    // An all-hex login of the same length is a login, not a mistyped address:
+    // the only non-base58 character it can hold is '0'.
+    if (is_hex_string(wallet)) return WalletValidationError::None;
+
+    for (unsigned char c : wallet) {
+        if (!is_base58_char(c))
+            return WalletValidationError::TariAddressCharset;
     }
     return WalletValidationError::None;
 }

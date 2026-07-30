@@ -47,6 +47,67 @@ static void test_wallet_validation() {
                   tari_miner::WalletValidationError::WhitespaceOrControl,
               "embedded control byte is rejected");
     }
+
+    check(tari_miner::validate_wallet("") ==
+              tari_miner::WalletValidationError::Empty,
+          "an empty wallet is rejected");
+    check(tari_miner::validate_wallet(
+              std::string(tari_miner::MAX_WALLET_LENGTH, 'a')) ==
+              tari_miner::WalletValidationError::None,
+          "the longest possible address length is accepted");
+    check(tari_miner::validate_wallet(
+              std::string(tari_miner::MAX_WALLET_LENGTH + 1, 'a')) ==
+              tari_miner::WalletValidationError::TooLong,
+          "a wallet longer than any Tari address is rejected");
+}
+
+static void test_tari_address_charset() {
+    std::puts("Tari address charset:");
+    // A dual address is 89-443 Base58 characters; a single address is 45-48.
+    // The filler is deliberately not a hex digit: a login made only of [0-9a-f]
+    // is exempt from the charset rule, and a real address is not hex.
+    const std::string dual(91, 'z');
+    const std::string single(46, 'z');
+    check(tari_miner::validate_wallet(dual) ==
+              tari_miner::WalletValidationError::None,
+          "a dual-length Base58 address is accepted");
+    check(tari_miner::validate_wallet(single) ==
+              tari_miner::WalletValidationError::None,
+          "a single-length Base58 address is accepted");
+
+    for (char typo : std::string("0OIl")) {
+        std::string address = dual;
+        address[40] = typo;
+        check(tari_miner::validate_wallet(address) ==
+                  tari_miner::WalletValidationError::TariAddressCharset,
+              "an address-shaped login with a non-Base58 character is rejected");
+
+        std::string short_address = single;
+        short_address[20] = typo;
+        check(tari_miner::validate_wallet(short_address) ==
+                  tari_miner::WalletValidationError::TariAddressCharset,
+              "a single-length address with a non-Base58 character is rejected");
+    }
+
+    // Lengths between and beyond the address ranges are logins, not addresses.
+    for (size_t length : {size_t(44), size_t(60), size_t(88)}) {
+        std::string login(length, '0');
+        check(tari_miner::validate_wallet(login) ==
+                  tari_miner::WalletValidationError::None,
+              "a login that is not address-shaped skips the charset rule");
+    }
+
+    std::string with_symbol = dual;
+    with_symbol[40] = '-';
+    check(tari_miner::validate_wallet(with_symbol) ==
+              tari_miner::WalletValidationError::None,
+          "a punctuated login of address length is not treated as an address");
+    check(tari_miner::validate_wallet(std::string(96, '0')) ==
+              tari_miner::WalletValidationError::None,
+          "an all-hex login of address length is not treated as an address");
+    check(tari_miner::validate_wallet("custom-pool-login") ==
+              tari_miner::WalletValidationError::None,
+          "a short custom login is still accepted");
 }
 
 static void test_pool_response_classification() {
@@ -244,6 +305,7 @@ static void test_solver_watchdog() {
 
 int main() {
     test_wallet_validation();
+    test_tari_address_charset();
     test_pool_response_classification();
     test_pending_submit_bound();
     test_status_ok_acceptance();
