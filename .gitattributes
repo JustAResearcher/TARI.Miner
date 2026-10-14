@@ -11,3 +11,5 @@
 *.h text eol=lf
 *.hpp text eol=lf
 *.md text eol=lf
+*.flags text eol=lf
+tests/fixtures/*.txt text eol=lf

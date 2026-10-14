@@ -1,17 +1,17 @@
 # TARI.Miner
 
-TARI.Miner is an open-source NVIDIA CUDA miner for Tari (XTM) Cuckaroo29.
-It connects to LuckyPool and has no developer fee, payout address, donation
+TARI.Miner is an open-source NVIDIA CUDA miner for Tari (XTM) Cuckaroo29, with
+experimental AMD support on Linux and HiveOS. It connects to LuckyPool and has no developer fee, payout address, donation
 schedule, or alternate mining connection.
 
 ## Download
 
-Open the [latest release](https://github.com/JustAResearcher/TARI.Miner/releases/latest)
+Open the [latest release](https://github.com/tari-project/TARI.Miner/releases/latest)
 and download one file for your operating system:
 
-- `TARI.Miner-v1.1.6-windows.zip`
-- `TARI.Miner-v1.1.6-linux.tar.gz`
-- `tari-miner-hiveos-1.1.6.tar.gz` for HiveOS
+- `TARI.Miner-v1.1.8-windows.zip`
+- `TARI.Miner-v1.1.8-linux.tar.gz`
+- `tari-miner-hiveos-1.1.8.tar.gz` for HiveOS
 
 Each package contains all supported GPU backends. The starter detects every
 NVIDIA GPU and selects the correct backend for each card:
@@ -30,9 +30,45 @@ runs out.
 
 The starter does not change GPU clocks, voltage, fans, or power limits.
 
+## AMD GPUs (experimental)
+
+AMD support is **experimental and not yet tested on hardware**. It is built
+from the same trimmer sources with HIP, compiles in CI, and passes every host
+test, but nobody has run it on an AMD GPU yet. Use it to help test, not to
+mine unattended.
+
+- Linux and HiveOS only; the Windows package has no AMD backend.
+- Supported GPUs, all in one binary (`bin/tari_c29_pool_miner_amd`):
+  - RDNA2: RX 6800, 6800 XT, 6900 XT, 6950 XT (gfx1030), RX 6700, 6700 XT,
+    6750 XT (gfx1031), RX 6600, 6600 XT, 6650 XT (gfx1032)
+  - RDNA3: RX 7900 XTX, 7900 XT, 7900 GRE (gfx1100), RX 7800 XT, 7700 XT
+    (gfx1101), RX 7600, 7600 XT (gfx1102)
+  - RDNA4: RX 9070, 9070 XT (gfx1201), RX 9060 XT (gfx1200)
+- Older AMD GPUs (Vega, Polaris) are not supported: the kernels need 32-lane
+  wavefronts.
+- Each solver context needs about 6 GB of VRAM.
+- The ROCm HIP runtime must be installed. The binaries link against
+  `libamdhip64.so.7` and are built with ROCm 7.2.4, so install ROCm 7.2 or
+  newer. `ldd bin/tari_c29_pool_miner_amd` shows whether the library is found.
+
+The Linux and HiveOS starters run `bin/tari_c29_pool_miner_amd --list-devices`
+to find AMD GPUs and start one worker per GPU, named like `RIG01-amd0`, next to
+the NVIDIA workers on a mixed rig. `TARI_AMD_DEVICES=0,2` selects AMD GPUs by
+the index `--list-devices` prints; `TARI_DEVICES` keeps selecting NVIDIA GPUs.
+A rig with only AMD GPUs does not need `nvidia-smi`. GPUs the backend has no
+code for, such as the integrated graphics of a Ryzen CPU or an RX 6400/6500
+(gfx1034), are skipped with a warning. If the HIP runtime itself has trouble
+with such a GPU, hide it with `HIP_VISIBLE_DEVICES`, for example
+`HIP_VISIBLE_DEVICES=0`; the remaining GPUs are then renumbered from 0.
+
+Please report results, good or bad, as a GitHub issue: the GPU model, the
+ROCm version, the `--list-devices` output, the first lines of the miner log,
+and its speed reports. `docs/amd-validation.md` describes the full check,
+including the exact recall test against the reference build.
+
 ## Windows
 
-1. Extract `TARI.Miner-v1.1.6-windows.zip`.
+1. Extract `TARI.Miner-v1.1.8-windows.zip`.
 2. Run `start-c29.bat`.
 3. Paste your Tari wallet address when prompted.
 4. Leave the starter window open while mining.
@@ -69,6 +105,21 @@ periodic speed report. Warnings and connection errors go to `gpu0.err.log`
 alongside it. The two streams are separate files on Windows; the Linux starter
 combines them into one.
 
+In the speed report, `speed` is the graph rate over about the last 60
+seconds and `avg` is the average since the miner started. The report keeps
+coming every 15 seconds during the waits between reconnect attempts, so time
+lost to a pool outage shows as a falling rate. It pauses while a connection
+attempt itself is blocked (an unreachable pool host can block a connect for up
+to about two minutes) and during the wait of up to 20 seconds for the first
+job after connecting. HiveOS shows 0 once the newest report is more than 90
+seconds old. `accepted` and `rejected` count shares since the miner started,
+across reconnects, and `t` is the report time in Unix seconds. `stale`
+counts graphs that were not searched for shares because the pool had already
+moved to a higher block height. Pools that still accept shares for the
+previous block for a short time may lose a few shares per block this way;
+pass `--no-stale-skip` to search and submit that work anyway (`stale` then
+stays 0).
+
 Pools that expect `wallet/worker` rather than `wallet.worker` need the login
 separator set alongside the pool:
 
@@ -86,7 +137,7 @@ start-c29.bat --pipeline 1
 
 ## Linux
 
-Extract `TARI.Miner-v1.1.6-linux.tar.gz`, then run:
+Extract `TARI.Miner-v1.1.8-linux.tar.gz`, then run:
 
 ```bash
 ./start-c29.sh
@@ -105,7 +156,9 @@ TARI_LOGIN_SEPARATOR=. \
 ```
 
 Use `TARI_DEVICES=0,2` to select specific GPUs. Press Ctrl+C to stop all GPU
-workers started by the script.
+workers started by the script. AMD GPUs (experimental, see above) are selected
+with `TARI_AMD_DEVICES` and log to `amd0.log`, `amd1.log`, and so on when
+`TARI_LOG_DIR` is set.
 
 ## HiveOS
 
@@ -113,7 +166,7 @@ Create a Custom miner in the Flight Sheet with these values:
 
 ```text
 Miner name: tari-miner-hiveos
-Installation URL: https://github.com/JustAResearcher/TARI.Miner/releases/download/v1.1.6/tari-miner-hiveos-1.1.6.tar.gz
+Installation URL: https://github.com/tari-project/TARI.Miner/releases/download/v1.1.8/tari-miner-hiveos-1.1.8.tar.gz
 Hash algorithm: cuckaroo29
 Wallet and worker template: %WAL%.%WORKER_NAME%
 Pool URL: stratum+tcp://taric29-ca.luckypool.io:3111
@@ -121,7 +174,9 @@ Pass: x
 ```
 
 The HiveOS launcher uses every supported GPU unless Extra config arguments
-contains a selector such as `TARI_DEVICES=0,2`. Other extra arguments are
+contains a selector such as `TARI_DEVICES=0,2` (NVIDIA) or
+`TARI_AMD_DEVICES=0` (AMD, experimental). For AMD GPUs, temperatures and fans
+come from the HiveOS agent's own GPU stats. Other extra arguments are
 passed to each miner process, for example `--pipeline 1`. Per-GPU graph rates,
 temperatures, fans, and share counters are reported to the HiveOS agent.
 
@@ -137,7 +192,10 @@ Options placed after the starter command are passed to every selected GPU:
 --login-separator S     Joins wallet and worker in the pool login; defaults to .
 --intensity N           Duty cycle from 1 to 100 percent; defaults to 100
 --pipeline N            Overlapped solver contexts; defaults automatically
+--ntrims N              Even trim-round count; defaults to the build's (50 on sm_89)
 --max-runtime-sec N     Stop after N seconds
+--no-stale-skip         Also search and submit work for a superseded block
+--list-devices          Print index, name, architecture and PCI bus of each GPU, then exit
 --version               Print version and exit
 ```
 
@@ -166,6 +224,28 @@ The starter supplies `--device`, `--pool`, `--wallet`, and `--worker` after
 user options so each GPU always receives its detected device index and unique
 worker name. If automatic allocation does not fit in VRAM, retry with
 `--pipeline 1`.
+
+### CPU-limited rigs
+
+After the GPU trims a graph, each miner process searches the remaining edges
+for cycles on one CPU thread. At the default 50 trim rounds that takes about
+30 ms per graph on a fast desktop core, about 0.4 of a core per RTX 4080. On a
+rig with a weak CPU and several GPUs (for example 2 cores feeding 4 or more
+fast GPUs) the CPU, not the GPUs, becomes the limit: CPU usage sits near 100%
+and each GPU's graph rate falls below what the same card makes in a desktop.
+
+On such a rig add `--ntrims 60`. Ten more trim rounds cost about 0.8% of GPU
+throughput (measured on an RTX 4080, sm_89) but cut the CPU work per graph by
+about 30%. That is **estimated** to raise the graph rate a CPU-bound rig can
+reach by about 40%; the estimate is modelled from RTX 4080 measurements and has
+not yet been measured on a real weak host. The proofs found are the same.
+Leave it off on a desktop or any rig with CPU to spare, where it only costs
+the 0.8%. `--ntrims 56` is a milder step. Measurements and the estimate behind
+this: `docs/ntrims_weak_host_2026-10-08.md`.
+
+```bash
+./start-c29.sh --ntrims 60
+```
 
 ### Pool login format
 
@@ -215,8 +295,9 @@ The starters propagate these. When a GPU worker exits non-zero, the starter
 stops the remaining workers and exits with that same code, rather than carrying
 on with its healthy GPUs — otherwise HiveOS never sees the failure. A starter
 that fails before any worker runs uses its own codes: 2 for a missing wallet, 3
-when `nvidia-smi` finds no GPU, 4 when `TARI_DEVICES` matches none, 5 for a
-missing backend binary, and 130 for Ctrl+C.
+when neither `nvidia-smi` nor the AMD backend finds a GPU, 4 when
+`TARI_DEVICES` and `TARI_AMD_DEVICES` match none, 5 for a missing backend
+binary, and 130 for Ctrl+C.
 
 ## Test The Solver
 
@@ -282,10 +363,81 @@ three target architectures:
 ./build_all.sh
 ```
 
+The experimental AMD backends need ROCm with `hipcc` (7.2 or newer, for the
+RDNA4 targets). Build them alone, or with the NVIDIA ones through `build_all.sh`:
+
+```bash
+./build_solver.sh amd
+./build_pool_miner.sh amd
+TARI_BUILD_AMD=1 ./build_all.sh
+```
+
+The `amd` arch compiles one binary for gfx1030, gfx1031, gfx1032, gfx1100,
+gfx1101, gfx1102, gfx1200 and gfx1201. Set `AMD_OFFLOAD_ARCHES` to a
+space-separated list to change that, and `HIPCC` to use another `hipcc`. Its
+release flags are in `build_flags/amd.flags`. AMD workgroups have 64 KB of
+shared memory, so the HIP build rejects `LATE_ROUND_BPB=8` and
+`ROUND0_DST_HASH_DYNAMIC_BITS` above 12 at compile time, and it does not
+support `TRIM_CUDA_GRAPH`.
+
 `build_all` also compiles the non-release reference solvers used by the recall
 test. Individual backends can be built with `build_solver` or
 `build_pool_miner` and one of `sm_86`, `sm_89`, or `sm_120`; pass `reference`
 as the second `build_solver` argument to build only that validation profile.
+
+Release builds add the tuning flags listed in `build_flags/<arch>.flags` (one
+nvcc flag per line; `#` starts a comment, blank lines are ignored). The same
+file is used by the `.sh` and `.bat` scripts, and each build prints the
+effective list. `sm_120` carries the tuned set, including 48 trim rounds;
+`sm_86` and `sm_89` are empty until they are tuned on real hardware. An
+architecture with no file builds with no extra flags. The reference profile
+ignores these files and pins every option to reference behaviour.
+
+To try a different set without editing files, for example during a tuning
+sweep, set `TARI_ARCH_FLAGS`. A non-empty value replaces the file for that
+build; a value of only a space builds with no extra flags:
+
+```bash
+TARI_ARCH_FLAGS="-DTARI_C29_DEFAULT_NTRIMS=48 -DROUND23_TPB=960" ./build_solver.sh sm_89
+```
+
+```bat
+set "TARI_ARCH_FLAGS=-DTARI_C29_DEFAULT_NTRIMS=48 -DROUND23_TPB=960"
+build_solver.bat sm_89
+```
+
+Experimental trim options, each off by default. Try them through
+`TARI_ARCH_FLAGS`. Measured on an RTX 4080 (sm_89) so far: only
+`SEEDA_CHECKPOINT=32` gained (+1.3%, now enabled in `build_flags/sm_89.flags`);
+`LATE_ROUND_SELF_ZERO_IDX` (-0.4%), `LATE_ROUND_BPB` (no gain) and
+`TRIM_CUDA_GRAPH` (**-17%**) did not. See `docs/sm89_results_2026-10-06.md`.
+
+- `-DLATE_ROUND_SELF_ZERO_IDX=1`: rounds 2, 3 and the late rounds clear the
+  bucket counts they read, replacing the per-round index memsets.
+- `-DTRIM_CUDA_GRAPH=1`: each solver context gets its own CUDA stream, and
+  Round 0 through the final edge count runs as one CUDA graph. It cost 17% on
+  sm_89; don't enable it without a benchmark on the target arch.
+- `-DLATE_ROUND_BPB=2`, `4` or `8`: each late-round block filters that many
+  buckets with one shared bitmap, cutting the late-round grid by the same
+  factor (default 1 keeps the existing kernel).
+- `-DSEEDA_CHECKPOINT=8`, `16` or `32`: SeedA keeps the first C hashes of each
+  64-edge block in registers and rehashes only from there, instead of
+  rehashing the whole block (default 0 keeps `SEEDA_REHASH`).
+
+`docs/spec2_gpu_validation.md` lists the GPU measurements and recall checks
+that decide whether to enable them; `docs/seeda_checkpoint.md` has the spill
+report and the steps for `SEEDA_CHECKPOINT`.
+
+`tests/tari_c29_gpu_recall.py` takes the expected release trim count from
+`-DTARI_C29_DEFAULT_NTRIMS=` in the same file (50 if absent). It honours
+`TARI_ARCH_FLAGS` too, so keep it set to the value the candidate solver was
+built with when running the recall test.
+
+The standalone solver's summary also reports the surviving edges per graph,
+the time of the host cycle search, and how busy that keeps the main thread
+(`--recall-jsonl` records the same numbers). `tools/ntrims_sweep.ps1` and
+`tools/ntrims_sweep.sh` use them to choose the trim count per architecture;
+`docs/ntrims_sweep.md` has the steps.
 
 ## License
 

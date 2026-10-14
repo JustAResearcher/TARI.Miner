@@ -10,22 +10,40 @@ the miner's C++ packing or difficulty code.  A recall file has this shape:
     {"type":"cycle","nonce":32,"difficulty":1,"edges":[... 42 integers ...]}
     {"type":"summary","graphs":4200,"cycles":100,"verify_failures":0}
 
+Newer solvers add per-graph cost statistics to the summary record (see
+``GRAPH_COST_KEYS``). They are optional, so older recall files still validate;
+when present, all of them must be present and consistent. They are timing and
+edge-count statistics only and play no part in the proof comparison.
+
 Use ``--help`` for validation, comparison, and live GPU invocation examples.
 """
 
 from __future__ import print_function
 
 import argparse
+import contextlib
 import datetime
 import hashlib
 import json
+import math
+import os
 from pathlib import Path
 import re
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
-from typing import Dict, FrozenSet, Iterable, List, Optional, Sequence, Tuple
+from typing import (
+    Dict,
+    FrozenSet,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 
 PROOF_SIZE = 42
@@ -35,7 +53,13 @@ PACKED_BYTES = (PROOF_SIZE * EDGE_BITS + 7) // 8
 MAX_U64 = (1 << 64) - 1
 MAX_U256 = (1 << 256) - 1
 DEFAULT_MINING_HASH = "".join("{:02x}".format(i) for i in range(32))
-SUPPORTED_ARCHES = ("sm_86", "sm_89", "sm_120")
+# "amd" is the HIP build: one binary for every supported gfx target, which
+# also reports its device as "amd".
+SUPPORTED_ARCHES = ("sm_86", "sm_89", "sm_120", "amd")
+REFERENCE_NTRIMS = 50
+BUILD_FLAGS_DIR = Path(__file__).resolve().parent.parent / "build_flags"
+ARCH_FLAGS_ENV = "TARI_ARCH_FLAGS"
+NTRIMS_FLAG = re.compile(r"-DTARI_C29_DEFAULT_NTRIMS=(\d+)")
 
 FATAL_PATTERNS = (
     ("fatal", re.compile(r"\bfatal(?:\s*:|\b)", re.IGNORECASE)),
@@ -50,6 +74,31 @@ FATAL_PATTERNS = (
         ),
     ),
 )
+
+
+# Optional summary keys written by solvers with the ntrims instrumentation.
+# Percentiles are nearest-rank; search_* is the host cycle search without the
+# GPU recovery; busy_fraction is search_sec / elapsed_sec.
+GRAPH_COST_INT_KEYS = (
+    "edges_min",
+    "edges_p50",
+    "edges_p99",
+    "edges_max",
+    "recovery_graphs",
+    "oops_graphs",
+    "node_overflow_graphs",
+)
+GRAPH_COST_NUMBER_KEYS = (
+    "search_ms_p50",
+    "search_ms_p99",
+    "search_ms_max",
+    "search_ms_mean",
+    "search_sec",
+    "recovery_sec",
+    "elapsed_sec",
+    "busy_fraction",
+)
+GRAPH_COST_KEYS = GRAPH_COST_INT_KEYS + GRAPH_COST_NUMBER_KEYS
 
 
 class RecallError(ValueError):
@@ -70,8 +119,53 @@ class RecallDataset:
     proofs: FrozenSet[ProofIdentity]
 
 
-def release_compiled_ntrims(arch: str) -> int:
-    return 48 if arch == "sm_120" else 50
+def parse_arch_flags(text: str) -> List[str]:
+    """Split a ``build_flags/<arch>.flags`` body the way the build scripts do.
+
+    Text from ``#`` to end of line is a comment; every remaining
+    whitespace-separated word (CR included as whitespace) is one flag.
+    """
+    flags: List[str] = []
+    for line in text.splitlines():
+        flags.extend(line.split("#", 1)[0].split())
+    return flags
+
+
+def ntrims_from_flags(flags: Iterable[str]) -> int:
+    """Return the TARI_C29_DEFAULT_NTRIMS a flag list compiles in (last wins)."""
+    ntrims = REFERENCE_NTRIMS
+    for flag in flags:
+        match = NTRIMS_FLAG.fullmatch(flag)
+        if match:
+            ntrims = int(match.group(1))
+    return ntrims
+
+
+def release_compiled_ntrims(
+    arch: str,
+    flags_dir: Optional[Path] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> int:
+    """Trim rounds a release build for ``arch`` compiles in by default.
+
+    Mirrors the build scripts: a non-empty ``TARI_ARCH_FLAGS`` replaces
+    ``build_flags/<arch>.flags`` (so set it to the same value the binary was
+    built with), otherwise the file is read. A missing file, or no
+    ``-DTARI_C29_DEFAULT_NTRIMS=`` flag, means the kernel default of 50.
+    """
+    env = os.environ if environ is None else environ
+    override = env.get(ARCH_FLAGS_ENV, "")
+    if override:
+        # Like the build scripts: the override is split on whitespace only.
+        return ntrims_from_flags(override.split())
+    path = (BUILD_FLAGS_DIR if flags_dir is None else Path(flags_dir)) / (
+        arch + ".flags"
+    )
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return REFERENCE_NTRIMS
+    return ntrims_from_flags(parse_arch_flags(text))
 
 
 def _require_int(
@@ -89,6 +183,44 @@ def _require_int(
             suffix = " and <= {}".format(maximum)
         raise RecallError("{} must be >= {}{}".format(key, minimum, suffix))
     return value
+
+
+def _require_number(record: Dict[str, object], key: str) -> float:
+    value = record.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RecallError("{} must be a number".format(key))
+    if not math.isfinite(value) or value < 0:
+        raise RecallError("{} must be a finite number >= 0".format(key))
+    return float(value)
+
+
+def _validate_graph_costs(summary: Dict[str, object], graphs: int) -> None:
+    """Check the optional per-graph cost keys: all or none, and consistent."""
+    present = [key for key in GRAPH_COST_KEYS if key in summary]
+    if not present:
+        return
+    missing = [key for key in GRAPH_COST_KEYS if key not in summary]
+    if missing:
+        raise RecallError(
+            "summary has some graph cost keys but is missing {}".format(
+                ", ".join(missing)
+            )
+        )
+    ints = {key: _require_int(summary, key, 0, MAX_U64) for key in GRAPH_COST_INT_KEYS}
+    numbers = {key: _require_number(summary, key) for key in GRAPH_COST_NUMBER_KEYS}
+    if not (
+        ints["edges_min"] <= ints["edges_p50"] <= ints["edges_p99"] <= ints["edges_max"]
+    ):
+        raise RecallError("summary edges must satisfy min <= p50 <= p99 <= max")
+    if not (
+        numbers["search_ms_p50"] <= numbers["search_ms_p99"] <= numbers["search_ms_max"]
+    ):
+        raise RecallError("summary search_ms must satisfy p50 <= p99 <= max")
+    if numbers["busy_fraction"] > 1:
+        raise RecallError("summary busy_fraction must be <= 1")
+    for key in ("recovery_graphs", "oops_graphs", "node_overflow_graphs"):
+        if ints[key] > graphs:
+            raise RecallError("summary {} exceeds graphs {}".format(key, graphs))
 
 
 def _require_nonempty_string(record: Dict[str, object], key: str) -> str:
@@ -343,6 +475,7 @@ def load_recall(path: Path, log_path: Optional[Path] = None) -> RecallDataset:
         raise RecallError(
             "summary reports {} host verification failures".format(verify_failures)
         )
+    _validate_graph_costs(last, graphs)
 
     if log_path is not None:
         fatal_markers = find_fatal_log_markers(Path(log_path))
@@ -361,10 +494,21 @@ def load_recall(path: Path, log_path: Optional[Path] = None) -> RecallDataset:
     )
 
 
+# Settings two recall files must share to be compared. compare_recall()
+# requires the same build and GPU architecture too; compare_proof_sets()
+# compares builds for different GPUs (AMD against NVIDIA), so it checks the
+# graph set and trim rounds only.
+SAME_BUILD_KEYS = ("mining_hash", "start_nonce", "count", "arch", "device_arch")
+CROSS_BUILD_KEYS = ("mining_hash", "start_nonce", "count", "ntrims")
+
+
 def compare_recall(
-    left: RecallDataset, right: RecallDataset, label: str = "recall"
+    left: RecallDataset,
+    right: RecallDataset,
+    label: str = "recall",
+    keys: Sequence[str] = SAME_BUILD_KEYS,
 ) -> Dict[str, object]:
-    for key in ("mining_hash", "start_nonce", "count", "arch", "device_arch"):
+    for key in keys:
         if left.metadata[key] != right.metadata[key]:
             raise RecallError(
                 "{} comparison metadata mismatch for {}: {!r} != {!r}".format(
@@ -402,6 +546,25 @@ def compare_recall(
         "left": str(left.path),
         "right": str(right.path),
     }
+
+
+def compare_proof_sets(
+    reference: RecallDataset, candidate: RecallDataset
+) -> Dict[str, object]:
+    """Exact proof-set comparison across GPU vendors or architectures.
+
+    Passes only when both files cover the same graphs with the same trim
+    rounds, the reference holds at least one proof, and the two sets of
+    (nonce, proof) pairs are identical.
+    """
+    if not reference.proofs:
+        raise RecallError(
+            "reference {} holds no proofs; it cannot show the candidate is "
+            "correct".format(reference.path)
+        )
+    return compare_recall(
+        reference, candidate, "reference/candidate proofs", CROSS_BUILD_KEYS
+    )
 
 
 def _dataset_report(dataset: RecallDataset) -> Dict[str, object]:
@@ -723,6 +886,7 @@ def _write_fixture(
     arch: str = "sm_120",
     device_arch: str = "sm_120",
     profile: str = "release",
+    summary_extra: Optional[Dict[str, object]] = None,
 ) -> None:
     if difficulty is None:
         try:
@@ -764,10 +928,22 @@ def _write_fixture(
             "verify_failures": verify_failures,
         }
     )
+    if summary_extra:
+        records[-1].update(summary_extra)
     path.write_text(
         "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
         encoding="utf-8",
     )
+
+
+@contextlib.contextmanager
+def _env_unset(name: str) -> Iterator[None]:
+    saved = os.environ.pop(name, None)
+    try:
+        yield
+    finally:
+        if saved is not None:
+            os.environ[name] = saved
 
 
 def self_test() -> int:
@@ -817,11 +993,83 @@ def self_test() -> int:
         difficulty_from_digest(bytes(32)) == MAX_U64,
         "zero digest caps to uint64 maximum",
     )
-    check(release_compiled_ntrims("sm_120") == 48, "sm_120 release ntrims")
-    check(release_compiled_ntrims("sm_89") == 50, "sm_89 release ntrims")
-    check(release_compiled_ntrims("sm_86") == 50, "sm_86 release ntrims")
+    no_env: Dict[str, str] = {}
+    check(
+        release_compiled_ntrims("sm_120", environ=no_env) == 48,
+        "sm_120 release ntrims from build_flags",
+    )
+    check(
+        release_compiled_ntrims("sm_89", environ=no_env) == 50,
+        "sm_89 release ntrims",
+    )
+    check(
+        release_compiled_ntrims("sm_86", environ=no_env) == 50,
+        "sm_86 release ntrims",
+    )
+    check(
+        release_compiled_ntrims("amd", environ=no_env) == 50,
+        "amd release ntrims",
+    )
+    check(
+        release_compiled_ntrims("sm_75", environ=no_env) == 50,
+        "arch without a flags file uses the default",
+    )
+    check(
+        release_compiled_ntrims(
+            "sm_120", environ={ARCH_FLAGS_ENV: "-DX=1 -DTARI_C29_DEFAULT_NTRIMS=44"}
+        )
+        == 44,
+        "TARI_ARCH_FLAGS replaces the flags file",
+    )
+    check(
+        release_compiled_ntrims(
+            "sm_120",
+            environ={ARCH_FLAGS_ENV: "-DTARI_C29_DEFAULT_NTRIMS=44\t#x\r"},
+        )
+        == 44,
+        "TARI_ARCH_FLAGS is split on whitespace only",
+    )
+    check(
+        release_compiled_ntrims("sm_120", environ={ARCH_FLAGS_ENV: " "}) == 50,
+        "blank TARI_ARCH_FLAGS means no extra flags",
+    )
+    check(
+        release_compiled_ntrims("sm_120", environ={ARCH_FLAGS_ENV: ""}) == 48,
+        "empty TARI_ARCH_FLAGS is ignored",
+    )
 
-    with tempfile.TemporaryDirectory(prefix="tari-recall-selftest-") as temp:
+    with tempfile.TemporaryDirectory(prefix="tari-recall-selftest-flags-") as temp:
+        flags_dir = Path(temp)
+        (flags_dir / "sm_empty.flags").write_text("", encoding="utf-8")
+        (flags_dir / "sm_comments.flags").write_bytes(
+            b"# header\r\n"
+            b"\r\n"
+            b"#-DTARI_C29_DEFAULT_NTRIMS=40\r\n"
+            b"  # -DTARI_C29_DEFAULT_NTRIMS=42\r\n"
+            b"-DROUND23_TPB=960 # -DTARI_C29_DEFAULT_NTRIMS=46\r\n"
+        )
+        (flags_dir / "sm_set.flags").write_bytes(
+            b"-DA=1\r\n\t-DTARI_C29_DEFAULT_NTRIMS=52 \t\r\n-DB=2"
+        )
+
+        def from_dir(arch: str) -> int:
+            return release_compiled_ntrims(arch, flags_dir, no_env)
+
+        check(from_dir("sm_empty") == 50, "empty flags file uses the default")
+        check(from_dir("sm_missing") == 50, "missing flags file uses the default")
+        check(from_dir("sm_comments") == 50, "commented-out ntrims is ignored")
+        check(from_dir("sm_set") == 52, "CRLF flags file with blanks is parsed")
+        check(
+            parse_arch_flags("-DA=1\r\n\t-DB=2 # c\r\n#-DC=3\n\n")
+            == ["-DA=1", "-DB=2"],
+            "flag file parsing",
+        )
+
+    # The fixtures below assume the committed sm_120 flags; a sweep override
+    # in the caller's environment must not change them.
+    with _env_unset(ARCH_FLAGS_ENV), tempfile.TemporaryDirectory(
+        prefix="tari-recall-selftest-"
+    ) as temp:
         root = Path(temp)
         valid = root / "valid.jsonl"
         valid_log = root / "valid.log"
@@ -885,6 +1133,94 @@ def self_test() -> int:
             "expected 48",
         )
 
+        amd = root / "amd.jsonl"
+        _write_fixture(
+            amd,
+            edges,
+            ntrims=50,
+            compiled_ntrims=50,
+            arch="amd",
+            device_arch="amd",
+        )
+        amd_dataset = load_recall(amd)
+        check(amd_dataset.metadata["arch"] == "amd", "amd build metadata")
+        expect_recall_error(
+            lambda: compare_recall(dataset, amd_dataset, "NVIDIA/AMD"),
+            "arch",
+        )
+
+        # compare-proofs: AMD against NVIDIA. Settings, not arch, must match.
+        def proof_set(
+            proofs: Iterable[Tuple[int, str]], **settings: object
+        ) -> RecallDataset:
+            metadata: Dict[str, object] = {
+                "mining_hash": DEFAULT_MINING_HASH,
+                "start_nonce": 0,
+                "count": 4200,
+                "ntrims": 50,
+                "arch": "sm_89",
+                "device_arch": "sm_89",
+            }
+            metadata.update(settings)
+            return RecallDataset(
+                path=root / "proof-set.jsonl",
+                metadata=metadata,
+                summary={},
+                proofs=frozenset(
+                    ProofIdentity(nonce=nonce, proof_hash=digest)
+                    for nonce, digest in proofs
+                ),
+            )
+
+        nvidia = proof_set([(3, "aa"), (9, "bb")])
+        amd_same = proof_set([(9, "bb"), (3, "aa")], arch="amd", device_arch="amd")
+        check(
+            compare_proof_sets(nvidia, amd_same)["proof_count"] == 2,
+            "compare-proofs: identical sets pass across arches",
+        )
+        expect_recall_error(
+            lambda: compare_proof_sets(nvidia, proof_set([(3, "aa")], arch="amd")),
+            "1 proof(s) only on left",
+        )
+        expect_recall_error(
+            lambda: compare_proof_sets(
+                nvidia, proof_set([(3, "aa"), (9, "bb"), (12, "cc")], arch="amd")
+            ),
+            "1 only on right",
+        )
+        expect_recall_error(
+            lambda: compare_proof_sets(
+                nvidia, proof_set([(3, "aa"), (9, "cc")], arch="amd")
+            ),
+            "mismatch",
+        )
+        for key, value in (
+            ("mining_hash", "11" * 32),
+            ("start_nonce", 1),
+            ("count", 4199),
+            ("ntrims", 48),
+        ):
+            expect_recall_error(
+                lambda key=key, value=value: compare_proof_sets(
+                    nvidia, proof_set([(3, "aa"), (9, "bb")], **{key: value})
+                ),
+                "mismatch for " + key,
+            )
+        expect_recall_error(
+            lambda: compare_proof_sets(proof_set([]), proof_set([])),
+            "holds no proofs",
+        )
+        check(
+            main(["compare-proofs", "--reference", str(valid), "--candidate", str(amd)])
+            == 1,
+            "compare-proofs CLI fails on different trim rounds",
+        )
+        check(
+            main(["compare-proofs", "--reference", str(valid), "--candidate", str(clone)])
+            == 0,
+            "compare-proofs CLI passes on identical files",
+        )
+
         reference = root / "reference.jsonl"
         _write_fixture(
             reference,
@@ -940,6 +1276,68 @@ def self_test() -> int:
         duplicate = root / "duplicate.jsonl"
         _write_fixture(duplicate, edges, summary_cycles=2, duplicate=True)
         expect_recall_error(lambda: load_recall(duplicate), "duplicate proof")
+
+        # Per-graph cost keys are optional: the old-format "valid" fixture
+        # above has none of them.
+        graph_costs = {
+            "edges_min": 90000,
+            "edges_p50": 120000,
+            "edges_p99": 150000,
+            "edges_max": 160000,
+            "search_ms_p50": 4.5,
+            "search_ms_p99": 7.25,
+            "search_ms_max": 9.0,
+            "search_ms_mean": 5.0,
+            "search_sec": 0.005,
+            "recovery_graphs": 1,
+            "recovery_sec": 0.002,
+            "elapsed_sec": 0.2,
+            "busy_fraction": 0.025,
+            "oops_graphs": 0,
+            "node_overflow_graphs": 0,
+        }
+        with_costs = root / "with-costs.jsonl"
+        _write_fixture(with_costs, edges, summary_extra=graph_costs)
+        with_costs_dataset = load_recall(with_costs)
+        check(
+            with_costs_dataset.summary["edges_max"] == 160000,
+            "summary with graph cost keys validates",
+        )
+        check(
+            compare_recall(dataset, with_costs_dataset, "old vs new")["proof_count"]
+            == 1,
+            "graph cost keys do not affect the proof comparison",
+        )
+        integer_ms = dict(graph_costs, search_ms_max=9, busy_fraction=0)
+        integer_ms_path = root / "integer-ms.jsonl"
+        _write_fixture(integer_ms_path, edges, summary_extra=integer_ms)
+        check(
+            load_recall(integer_ms_path).summary["search_ms_max"] == 9,
+            "integral JSON numbers are accepted for timing keys",
+        )
+
+        bad_costs = (
+            ("partial", {"edges_max": 5}, "missing"),
+            ("string", {"edges_p99": "150000"}, "edges_p99 must be an integer"),
+            ("float edges", {"edges_min": 1.5}, "edges_min must be an integer"),
+            ("bool", {"oops_graphs": False}, "oops_graphs must be an integer"),
+            ("negative", {"edges_min": -1}, "edges_min must be >= 0"),
+            ("negative ms", {"search_ms_p50": -0.5}, "finite number"),
+            # json.loads accepts NaN, which is not valid JSON.
+            ("nan", {"elapsed_sec": float("nan")}, "finite number"),
+            ("string ms", {"search_sec": "1"}, "must be a number"),
+            ("edge order", {"edges_p50": 170000}, "min <= p50"),
+            ("ms order", {"search_ms_p99": 10.0}, "p50 <= p99"),
+            ("busy", {"busy_fraction": 1.5}, "busy_fraction"),
+            ("oops count", {"oops_graphs": 2}, "exceeds graphs"),
+            ("recovery count", {"recovery_graphs": 2}, "exceeds graphs"),
+            ("negative recovery", {"recovery_sec": -1.0}, "finite number"),
+        )
+        for name, change, message in bad_costs:
+            extra = change if name == "partial" else dict(graph_costs, **change)
+            bad_path = root / "bad-costs-{}.jsonl".format(name.replace(" ", "-"))
+            _write_fixture(bad_path, edges, summary_extra=extra)
+            expect_recall_error(lambda path=bad_path: load_recall(path), message)
 
         fatal_log = root / "fatal.log"
         fatal_log.write_text(
@@ -1033,6 +1431,16 @@ def build_parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("--left-log", type=Path)
     compare_parser.add_argument("--right-log", type=Path)
 
+    proofs_parser = subparsers.add_parser(
+        "compare-proofs",
+        help=(
+            "check a candidate finds exactly the reference's proofs, across "
+            "GPU vendors (same graphs and trim rounds; arch may differ)"
+        ),
+    )
+    proofs_parser.add_argument("--reference", required=True, type=Path)
+    proofs_parser.add_argument("--candidate", required=True, type=Path)
+
     run_parser = subparsers.add_parser(
         "run", help="run the complete five-invocation GPU recall sequence"
     )
@@ -1100,6 +1508,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             right = load_recall(args.right, args.right_log)
             result = compare_recall(left, right, "exact recall")
             print(json.dumps(result, indent=2, sort_keys=True))
+            return 0
+        if args.command == "compare-proofs":
+            reference = load_recall(args.reference)
+            candidate = load_recall(args.candidate)
+            result = compare_proof_sets(reference, candidate)
+            print(
+                "PASS: {} identical proofs in {} and {}".format(
+                    result["proof_count"], args.reference, args.candidate
+                )
+            )
             return 0
         if args.command == "run":
             if args.device < 0:

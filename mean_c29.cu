@@ -8,10 +8,13 @@
 #include <vector>
 #include <assert.h>
 #include <algorithm>
+#include <type_traits>
+#include "gpu_compat.h"
 #include "cuckaroo.hpp"
 #include "graph.hpp"
 #include "../crypto/siphash.cuh"
 #include "../crypto/blake2.h"
+#include "seeda_checkpoint.h"
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -122,6 +125,15 @@ const u32 ROW_EDGES_B = EDGES_B * NY;
 #ifndef SEEDA_REHASH
 #define SEEDA_REHASH 0
 #endif
+// Experimental. SeedA buffers the first C hashes of each 64-edge block in
+// registers and restarts from a saved state for the rest (seeda_checkpoint.h):
+// 64 + (63 - C) hashes per block instead of 127. Non-zero overrides SEEDA_REHASH.
+#ifndef SEEDA_CHECKPOINT
+#define SEEDA_CHECKPOINT 0
+#endif
+#if SEEDA_CHECKPOINT != 0 && SEEDA_CHECKPOINT != 8 && SEEDA_CHECKPOINT != 16 && SEEDA_CHECKPOINT != 32
+#error "SEEDA_CHECKPOINT must be 0, 8, 16 or 32"
+#endif
 
 #ifndef GPUASSERT_RESET_ON_ERROR
 #define GPUASSERT_RESET_ON_ERROR 0
@@ -151,6 +163,30 @@ const u32 ROW_EDGES_B = EDGES_B * NY;
 #endif
 #ifndef FUSE_FINAL_TAIL_CURRENT
 #define FUSE_FINAL_TAIL_CURRENT 0
+#endif
+// Experimental. Rounds 2, 3 and the late rounds zero their source bucket
+// counts once they have read them, replacing the per-round index memsets.
+#ifndef LATE_ROUND_SELF_ZERO_IDX
+#define LATE_ROUND_SELF_ZERO_IDX 0
+#endif
+// Experimental. Each trimmer gets its own stream, and Round 0 through the
+// final count copy is launched as one CUDA graph built on first use.
+#ifndef TRIM_CUDA_GRAPH
+#define TRIM_CUDA_GRAPH 0
+#endif
+#if TRIM_CUDA_GRAPH && !SQUASH_OUTPUT
+#error "TRIM_CUDA_GRAPH needs SQUASH_OUTPUT: the verbose path syncs the device between rounds"
+#endif
+#if TRIM_CUDA_GRAPH && TARI_GPU_HIP
+#error "TRIM_CUDA_GRAPH is not supported by the HIP (AMD) build"
+#endif
+// Experimental. Source buckets per block in the late rounds; 1 keeps Round,
+// 2, 4 or 8 use RoundMulti with NX2 / LATE_ROUND_BPB blocks.
+#ifndef LATE_ROUND_BPB
+#define LATE_ROUND_BPB 1
+#endif
+#if LATE_ROUND_BPB != 1 && LATE_ROUND_BPB != 2 && LATE_ROUND_BPB != 4 && LATE_ROUND_BPB != 8
+#error "LATE_ROUND_BPB must be 1, 2, 4 or 8"
 #endif
 // Number of Parts of BufferB, all but one of which will overlap BufferA
 #ifndef NB
@@ -185,6 +221,35 @@ __device__ u32 endpoint(uint2 nodes, int uorv) {
 #define FLUSHA 8
 #endif
 
+// SeedA's per-edge body. Every thread of the block must call it the same
+// number of times (64 per edge block), because it has two barriers.
+template<int maxOut>
+__device__ __forceinline__ void seedAEmit(const u64 edge, uint2 (*tmp)[2*FLUSHA], int *counters, const int col,
+                                          ulonglong4 * __restrict__ buffer, u32 * __restrict__ indexes) {
+  const int FLUSHA2 = 2*FLUSHA;
+  const int TMPPERLL4 = sizeof(ulonglong4) / sizeof(uint2);
+  u32 node0 = edge & EDGEMASK;
+  u32 node1 = (edge >> 32) & EDGEMASK;
+  int row = node0 >> YZBITS;
+  int counter = min((int)atomicAdd(counters + row, 1), (int)(FLUSHA2-1)); // assuming ROWS_LIMIT_LOSSES checked
+  tmp[row][counter] = make_uint2(node0, node1);
+  __syncthreads();
+  if (counter == FLUSHA-1) {
+    int localIdx = min(FLUSHA2, counters[row]);
+    int newCount = localIdx % FLUSHA;
+    int nflush = localIdx - newCount;
+    u32 grp = row * NX + col;
+    int cnt = min((int)atomicAdd(indexes + grp, nflush), (int)(maxOut - nflush));
+    for (int i = 0; i < nflush; i += TMPPERLL4)
+      buffer[((u64)grp * maxOut + cnt + i) / TMPPERLL4] = *(ulonglong4 *)(&tmp[row][i]);
+    for (int t = 0; t < newCount; t++) {
+      tmp[row][t] = tmp[row][t + nflush];
+    }
+    counters[row] = newCount;
+  }
+  __syncthreads();
+}
+
 template<int maxOut>
 __global__ void SeedA(const siphash_keys sipkeys, ulonglong4 * __restrict__ buffer, u32 * __restrict__ indexes) {
   const int group = blockIdx.x;
@@ -194,10 +259,10 @@ __global__ void SeedA(const siphash_keys sipkeys, ulonglong4 * __restrict__ buff
   const int nthreads = gridDim.x * dim;
   const int FLUSHA2 = 2*FLUSHA;
 
-  __shared__ uint2 tmp[NX][FLUSHA2]; // needs to be ulonglong4 aligned
+  __shared__ TARI_LDS_ALIGN_ULL4 uint2 tmp[NX][FLUSHA2]; // needs to be ulonglong4 aligned
   __shared__ int counters[NX];
   const int TMPPERLL4 = sizeof(ulonglong4) / sizeof(uint2);
-#if !SEEDA_REHASH
+#if !SEEDA_CHECKPOINT && !SEEDA_REHASH
   u64 buf[EDGE_BLOCK_SIZE];
 #endif
 
@@ -209,7 +274,11 @@ __global__ void SeedA(const siphash_keys sipkeys, ulonglong4 * __restrict__ buff
   const int loops = NEDGES / nthreads; // assuming THREADS_HAVE_EDGES checked
   for (int blk = 0; blk < loops; blk += EDGE_BLOCK_SIZE) {
     u32 nonce0 = gid * loops + blk;
-#if SEEDA_REHASH
+#if SEEDA_CHECKPOINT
+    static_assert(EDGE_BLOCK_SIZE == 64, "seedaCheckpointBlock assumes 64-edge blocks");
+    auto emit = [&](const u64 edge) { seedAEmit<maxOut>(edge, tmp, counters, col, buffer, indexes); };
+    seedaCheckpointBlock<SEEDA_CHECKPOINT, diphash_state<> >(sipkeys, nonce0 & ~EDGE_BLOCK_MASK, emit);
+#elif SEEDA_REHASH
     const word_t edge0 = nonce0 & ~EDGE_BLOCK_MASK;
     diphash_state<> lastState(sipkeys);
     for (u32 e = 0; e < EDGE_BLOCK_SIZE; e++)
@@ -224,32 +293,13 @@ __global__ void SeedA(const siphash_keys sipkeys, ulonglong4 * __restrict__ buff
       } else {
         edge = last;
       }
+      seedAEmit<maxOut>(edge, tmp, counters, col, buffer, indexes);
+    }
 #else
     const u64 last = dipblock(sipkeys, nonce0, buf);
-    for (u32 e = 0; e < EDGE_BLOCK_SIZE; e++) {
-      u64 edge = buf[e] ^ last;
+    for (u32 e = 0; e < EDGE_BLOCK_SIZE; e++)
+      seedAEmit<maxOut>(buf[e] ^ last, tmp, counters, col, buffer, indexes);
 #endif
-      u32 node0 = edge & EDGEMASK;
-      u32 node1 = (edge >> 32) & EDGEMASK;
-      int row = node0 >> YZBITS;
-      int counter = min((int)atomicAdd(counters + row, 1), (int)(FLUSHA2-1)); // assuming ROWS_LIMIT_LOSSES checked
-      tmp[row][counter] = make_uint2(node0, node1);
-      __syncthreads();
-      if (counter == FLUSHA-1) {
-        int localIdx = min(FLUSHA2, counters[row]);
-        int newCount = localIdx % FLUSHA;
-        int nflush = localIdx - newCount;
-        u32 grp = row * NX + col;
-        int cnt = min((int)atomicAdd(indexes + grp, nflush), (int)(maxOut - nflush));
-        for (int i = 0; i < nflush; i += TMPPERLL4)
-          buffer[((u64)grp * maxOut + cnt + i) / TMPPERLL4] = *(ulonglong4 *)(&tmp[row][i]);
-        for (int t = 0; t < newCount; t++) {
-          tmp[row][t] = tmp[row][t + nflush];
-        }
-        counters[row] = newCount;
-      }
-      __syncthreads();
-    }
   }
   uint2 zero = make_uint2(0, 0);
   for (int row = lid; row < NX; row += dim) {
@@ -285,7 +335,7 @@ __global__ void SeedB(const uint2 * __restrict__ source, ulonglong4 * __restrict
   const int lid = threadIdx.x;
   const int FLUSHB2 = 2 * FLUSHB;
 
-  __shared__ uint2 tmp[NX][FLUSHB2];
+  __shared__ TARI_LDS_ALIGN_ULL4 uint2 tmp[NX][FLUSHB2];
   const int TMPPERLL4 = sizeof(ulonglong4) / sizeof(uint2);
   __shared__ int counters[NX];
 
@@ -355,6 +405,9 @@ __global__ void SeedB(const uint2 * __restrict__ source, ulonglong4 * __restrict
 constexpr int DUP_COUNTER_OFFSET = NZ / 32 + ROUND_COUNTER_PAD;
 constexpr int ROUND_COUNTER_WORDS = NZ / 16 + ROUND_COUNTER_PAD;
 
+// DUP_OFFSET is the word offset of the "seen twice" bitmap; RoundMulti uses
+// a larger one for its BPB-bucket bitmap.
+template<int DUP_OFFSET = DUP_COUNTER_OFFSET>
 __device__ __forceinline__  void Increase2bCounter(u32 *ecounters, const int bucket) {
   int word = bucket >> 5;
   unsigned char bit = bucket & 0x1F;
@@ -362,14 +415,15 @@ __device__ __forceinline__  void Increase2bCounter(u32 *ecounters, const int buc
 
   u32 old = atomicOr(ecounters + word, mask) & mask;
   if (old)
-    atomicOr(ecounters + word + DUP_COUNTER_OFFSET, mask);
+    atomicOr(ecounters + word + DUP_OFFSET, mask);
 }
 
+template<int DUP_OFFSET = DUP_COUNTER_OFFSET>
 __device__ __forceinline__  bool Read2bCounter(u32 *ecounters, const int bucket) {
   int word = bucket >> 5;
   unsigned char bit = bucket & 0x1F;
 
-  return (ecounters[word + DUP_COUNTER_OFFSET] >> bit) & 1;
+  return (ecounters[word + DUP_OFFSET] >> bit) & 1;
 }
 
 __device__ __forceinline__ uint2 LoadRoundEdge(const uint2 *src, const int index) {
@@ -393,6 +447,10 @@ __device__ __forceinline__ void StoreRoundEdge(uint2 *dst, const int index, cons
 constexpr u32 ROUND0_DST_HASH_EMPTY = 0xffffffffu;
 constexpr int ROUND0_DST_HASH_DYNAMIC_SLOTS = 1 << ROUND0_DST_HASH_DYNAMIC_BITS;
 constexpr int ROUND0_DST_HASH_DYNAMIC_WORDS = ROUND_COUNTER_WORDS + 3 * ROUND0_DST_HASH_DYNAMIC_SLOTS;
+#if TARI_GPU_HIP
+static_assert(ROUND0_DST_HASH_DYNAMIC_WORDS * sizeof(u32) <= TARI_HIP_MAX_LDS_BYTES,
+              "ROUND0_DST_HASH_DYNAMIC_BITS needs more than the 64 KB of shared memory an AMD workgroup has; use 12 or less");
+#endif
 
 __device__ __forceinline__ u32 Round0DstHashBucket(const u32 bucket) {
   u32 h = bucket ^ (bucket >> ROUND0_DST_HASH_DYNAMIC_BITS);
@@ -430,14 +488,14 @@ __device__ __forceinline__ void StoreRoundDirectWarp(uint2 *dst, u32 *dstIdx, co
                                                      const unsigned activeMask) {
 #if WARP_DST_ATOMICS
   const unsigned lane = threadIdx.x & 31;
-  const unsigned mask = __match_any_sync(activeMask, bucket);
+  const unsigned mask = tari_match_any_sync(activeMask, bucket);
   const unsigned rank = __popc(mask & ((1u << lane) - 1));
   const unsigned count = __popc(mask);
   const unsigned leader = __ffs(mask) - 1;
   u32 base = 0;
   if (lane == leader)
     base = atomicAdd(dstIdx + bucket, count);
-  base = __shfl_sync(mask, base, leader);
+  base = tari_shfl_sync(mask, base, leader);
   const u32 bktIdx = min(base + rank, (u32)(maxOut - 1));
   StoreRoundEdge(dst, bucket * maxOut + bktIdx, edge);
 #else
@@ -513,7 +571,7 @@ __global__ void Round0DstHashDynamic(const uint2 * __restrict__ src, uint2 * __r
       StoreRoundEdge(dst, bucket * maxOut + bktIdx, outEdge);
     }
 #else
-    const unsigned fallbackMask = __ballot_sync(__activemask(), fallback);
+    const unsigned fallbackMask = tari_ballot_sync(tari_activemask(), fallback);
     if (fallback)
       StoreRoundDirectWarp(dst, dstIdx, maxOut, bucket, outEdge, fallbackMask);
 #endif
@@ -558,8 +616,13 @@ __global__ void Round0DstHashDynamic(const uint2 * __restrict__ src, uint2 * __r
 
 #endif
 
-template<int NP, int maxIn, int maxOut, int UORV, int CHECK_NULL>
-__global__ void Round(const uint2 * __restrict__ src, uint2 * __restrict__ dst, const u32 * __restrict__ srcIdx, u32 * __restrict__ dstIdx) {
+// With ZERO_SRC_IDX, block `group` (the only reader of srcIdx[group]) zeroes
+// that count after its last read, so the index buffer is already clear when a
+// later round uses it as its destination.
+template<int NP, int maxIn, int maxOut, int UORV, int CHECK_NULL, int ZERO_SRC_IDX = 0>
+__global__ void Round(const uint2 * __restrict__ src, uint2 * __restrict__ dst,
+                      typename std::conditional<ZERO_SRC_IDX != 0, u32, const u32>::type * __restrict__ srcIdx,
+                      u32 * __restrict__ dstIdx) {
   const int group = blockIdx.x;
   const int dim = blockDim.x;
   const int lid = threadIdx.x;
@@ -622,14 +685,14 @@ __global__ void Round(const uint2 * __restrict__ src, uint2 * __restrict__ dst, 
 #if WARP_DST_ATOMICS
           if constexpr (maxIn > EDGES_B/4 || WARP_DST_ATOMICS_LATE) {
           const unsigned lane = threadIdx.x & 31;
-          const unsigned mask = __match_any_sync(__activemask(), bucket);
+          const unsigned mask = tari_match_any_sync(tari_activemask(), bucket);
           const unsigned rank = __popc(mask & ((1u << lane) - 1));
           const unsigned count = __popc(mask);
           const unsigned leader = __ffs(mask) - 1;
           u32 base = 0;
           if (lane == leader)
             base = atomicAdd(dstIdx + bucket, count);
-          base = __shfl_sync(mask, base, leader);
+          base = tari_shfl_sync(mask, base, leader);
           const u32 bktIdx = min(base + rank, (u32)(maxOut - 1));
           StoreRoundEdge(dst, bucket * maxOut + bktIdx, outEdge);
           } else {
@@ -644,7 +707,120 @@ __global__ void Round(const uint2 * __restrict__ src, uint2 * __restrict__ dst, 
       }
     }
   }
+
+  if constexpr (ZERO_SRC_IDX != 0) {
+    static_assert(NP == 1, "ZERO_SRC_IDX supports single-part rounds only");
+    srcIdx -= NP * NX2;
+    // Every thread has read srcIdx[group] for the second pass.
+    __syncthreads();
+    if (lid == 0)
+      srcIdx[group] = 0;
+  }
 }
+
+#if LATE_ROUND_BPB > 1
+// Shared memory words for RoundMulti: two bitmaps of BPB * NZ bits.
+__host__ __device__ constexpr int MultiCounterWords(const int bpb) {
+  return bpb * NZ / 16 + ROUND_COUNTER_PAD;
+}
+
+// Late-round copy of Round<1, ...>: each block counts and filters BPB
+// consecutive source buckets with one bitmap of BPB * NZ nodes, so the grid
+// is NX2 / BPB blocks. Bucket j of the block owns counters
+// (j << ZBITS) | (node & ZMASK), an NZ-bit slice of its own, so each bucket
+// keeps exactly the counts Round keeps for it. The output layout is unchanged.
+template<int maxIn, int maxOut, int UORV, int CHECK_NULL, int BPB, int ZERO_SRC_IDX>
+__global__ void RoundMulti(const uint2 * __restrict__ src, uint2 * __restrict__ dst,
+                           typename std::conditional<ZERO_SRC_IDX != 0, u32, const u32>::type * __restrict__ srcIdx,
+                           u32 * __restrict__ dstIdx) {
+  constexpr int COUNTER_WORDS = MultiCounterWords(BPB);
+  constexpr int DUP_OFFSET = BPB * NZ / 32 + ROUND_COUNTER_PAD;
+  const int dim = blockDim.x;
+  const int lid = threadIdx.x;
+
+  extern __shared__ u32 multiCounters[]; // COUNTER_WORDS, dynamic: may exceed 48 KB
+  for (int i = lid; i < COUNTER_WORDS; i += dim)
+    multiCounters[i] = 0;
+  __syncthreads();
+
+  for (int j = 0; j < BPB; j++) {
+    const int group = blockIdx.x * BPB + j;
+    const int edgesInBucket = min(srcIdx[group], maxIn);
+    const int loops = (edgesInBucket + dim-1) / dim;
+
+    for (int loop = 0; loop < loops; loop++) {
+      const int lindex = loop * dim + lid;
+      if (lindex < edgesInBucket) {
+        const int index = maxIn * group + lindex;
+        uint2 edge = LoadRoundEdge(src, index);
+        if constexpr (CHECK_NULL) {
+          if (null(edge)) continue;
+        }
+        u32 node = UORV ? edge.y : edge.x;
+        Increase2bCounter<DUP_OFFSET>(multiCounters, (j << ZBITS) | (node & ZMASK));
+      }
+    }
+  }
+
+  __syncthreads();
+
+  for (int j = 0; j < BPB; j++) {
+    const int group = blockIdx.x * BPB + j;
+    const int edgesInBucket = min(srcIdx[group], maxIn);
+    const int loops = (edgesInBucket + dim-1) / dim;
+    for (int loop = 0; loop < loops; loop++) {
+      const int lindex = loop * dim + lid;
+      if (lindex < edgesInBucket) {
+        const int index = maxIn * group + lindex;
+        uint2 edge = LoadRoundEdge(src, index);
+        if constexpr (CHECK_NULL) {
+          if (null(edge)) continue;
+        }
+        u32 node0 = UORV ? edge.y : edge.x;
+        if (Read2bCounter<DUP_OFFSET>(multiCounters, (j << ZBITS) | (node0 & ZMASK))) {
+          u32 node1 = UORV ? edge.x : edge.y;
+          const int bucket = node1 >> ZBITS;
+          const uint2 outEdge = UORV ? make_uint2(node1, node0) : make_uint2(node0, node1);
+#if WARP_DST_ATOMICS
+          if constexpr (maxIn > EDGES_B/4 || WARP_DST_ATOMICS_LATE) {
+          const unsigned lane = threadIdx.x & 31;
+          const unsigned mask = tari_match_any_sync(tari_activemask(), bucket);
+          const unsigned rank = __popc(mask & ((1u << lane) - 1));
+          const unsigned count = __popc(mask);
+          const unsigned leader = __ffs(mask) - 1;
+          u32 base = 0;
+          if (lane == leader)
+            base = atomicAdd(dstIdx + bucket, count);
+          base = tari_shfl_sync(mask, base, leader);
+          const u32 bktIdx = min(base + rank, (u32)(maxOut - 1));
+          StoreRoundEdge(dst, bucket * maxOut + bktIdx, outEdge);
+          } else {
+          const int bktIdx = min(atomicAdd(dstIdx + bucket, 1), maxOut - 1);
+          StoreRoundEdge(dst, bucket * maxOut + bktIdx, outEdge);
+          }
+#else
+          const int bktIdx = min(atomicAdd(dstIdx + bucket, 1), maxOut - 1);
+          StoreRoundEdge(dst, bucket * maxOut + bktIdx, outEdge);
+#endif
+        }
+      }
+    }
+  }
+
+  if constexpr (ZERO_SRC_IDX != 0) {
+    // Every thread has read the block's counts for the second pass.
+    __syncthreads();
+    for (int j = lid; j < BPB; j += dim)
+      srcIdx[blockIdx.x * BPB + j] = 0;
+  }
+}
+
+constexpr size_t LATE_ROUND_MULTI_SMEM = MultiCounterWords(LATE_ROUND_BPB) * sizeof(u32);
+#if TARI_GPU_HIP
+static_assert(LATE_ROUND_MULTI_SMEM <= TARI_HIP_MAX_LDS_BYTES,
+              "LATE_ROUND_BPB needs more than the 64 KB of shared memory an AMD workgroup has; use 1, 2 or 4");
+#endif
+#endif
 
 template<int maxIn>
 __global__ void Tail(const uint2 *source, uint2 *destination, const u32 *srcIdx, u32 *dstIdx) {
@@ -701,8 +877,8 @@ __global__ void FusedFinalTail(const uint2 * __restrict__ src, uint2 * __restric
       edge = LoadRoundEdge(src, index);
       keep = Read2bCounter(ecounters, edge.y & ZMASK);
     }
-    const unsigned activeMask = __activemask();
-    const unsigned keepMask = __ballot_sync(activeMask, keep);
+    const unsigned activeMask = tari_activemask();
+    const unsigned keepMask = tari_ballot_sync(activeMask, keep);
     if (keep) {
       const unsigned lane = threadIdx.x & 31;
       const unsigned rank = __popc(keepMask & ((1u << lane) - 1));
@@ -711,7 +887,7 @@ __global__ void FusedFinalTail(const uint2 * __restrict__ src, uint2 * __restric
       u32 base = 0;
       if (lane == leader)
         base = atomicAdd(dstIdx, count);
-      base = __shfl_sync(keepMask, base, leader);
+      base = tari_shfl_sync(keepMask, base, leader);
       dst[base + rank] = edge;
     }
   }
@@ -813,8 +989,20 @@ struct edgetrimmer {
   siphash_keys sipkeys;
   bool abort = false;
   bool initsuccess = false;
+  // All trim, edge copy and recovery work goes to this stream. It stays 0,
+  // the calling thread's default stream, unless TRIM_CUDA_GRAPH is set.
+  cudaStream_t stream = 0;
+#if TRIM_CUDA_GRAPH
+  cudaGraphExec_t graphExec = nullptr; // Round 0 through the final count copy
+  u16 graphNtrims = 0;                 // tp.ntrims the graph was captured with
+  u32 *hostCount = nullptr;            // pinned target of the graph's count copy
+#endif
 
   edgetrimmer(const trimparams _tp) : tp(_tp) {
+#if TRIM_CUDA_GRAPH
+    checkCudaErrors_V(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    checkCudaErrors_V(cudaMallocHost((void**)&hostCount, sizeof(u32)));
+#endif
     checkCudaErrors_V(cudaMalloc((void**)&dt, sizeof(edgetrimmer)));
     for (int i = 0; i < 1+NB; i++) {
       checkCudaErrors_V(cudaMalloc((void**)&indexesE[i], indexesSize));
@@ -832,6 +1020,18 @@ struct edgetrimmer {
                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
                                            ROUND0_DST_HASH_DYNAMIC_WORDS * sizeof(u32)));
 #endif
+#if LATE_ROUND_SELF_ZERO_IDX
+    assert(tp.trim.blocks == NX2); // one trim block per bucket, so every count gets zeroed
+#endif
+#if LATE_ROUND_BPB > 1
+    assert(tp.trim.blocks % LATE_ROUND_BPB == 0);
+    checkCudaErrors_V(cudaFuncSetAttribute(RoundMulti<EDGES_B/4, EDGES_B/4, 0, !SKIP_LATE_NULL_CHECKS, LATE_ROUND_BPB, LATE_ROUND_SELF_ZERO_IDX>,
+                                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                           LATE_ROUND_MULTI_SMEM));
+    checkCudaErrors_V(cudaFuncSetAttribute(RoundMulti<EDGES_B/4, EDGES_B/4, 1, !SKIP_LATE_NULL_CHECKS, LATE_ROUND_BPB, LATE_ROUND_SELF_ZERO_IDX>,
+                                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                           LATE_ROUND_MULTI_SMEM));
+#endif
     checkCudaErrors_V(cudaMemcpy(dt, this, sizeof(edgetrimmer), cudaMemcpyHostToDevice));
     initsuccess = true;
   }
@@ -839,6 +1039,14 @@ struct edgetrimmer {
     return (sizeA+sizeB/NB) + (1+NB) * indexesSize + sizeof(edgetrimmer);
   }
   ~edgetrimmer() {
+#if TRIM_CUDA_GRAPH
+    if (graphExec)
+      checkCudaErrors_V(cudaGraphExecDestroy(graphExec));
+    if (stream)
+      checkCudaErrors_V(cudaStreamDestroy(stream));
+    if (hostCount)
+      checkCudaErrors_V(cudaFreeHost(hostCount));
+#endif
     if (bufferA)
       checkCudaErrors_V(cudaFree(bufferA));
     for (int i = 0; i < 1+NB; i++) {
@@ -847,6 +1055,34 @@ struct edgetrimmer {
     }
     if (dt)
       checkCudaErrors_V(cudaFree(dt));
+  }
+  // cudaMemset on this trimmer's stream. Without TRIM_CUDA_GRAPH that stream
+  // is the calling thread's default stream and this is the plain call.
+  cudaError_t memset_zero(void *dst, size_t bytes) {
+#if TRIM_CUDA_GRAPH
+    return cudaMemsetAsync(dst, 0, bytes, stream);
+#else
+    return cudaMemset(dst, 0, bytes);
+#endif
+  }
+  // Device-to-host copy, ordered after the work queued on this trimmer's
+  // stream and finished when it returns, like cudaMemcpy.
+  cudaError_t copy_to_host(void *dst, const void *src, size_t bytes) {
+#if TRIM_CUDA_GRAPH
+    cudaError_t rc = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream);
+    return rc == cudaSuccess ? cudaStreamSynchronize(stream) : rc;
+#else
+    return cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost);
+#endif
+  }
+  // Final surviving-edge count. In graph mode this is a captured copy into
+  // pinned hostCount, read after the graph has run.
+  void copy_count(const u32 *src) {
+#if TRIM_CUDA_GRAPH
+    cudaMemcpyAsync(hostCount, src, sizeof(u32), cudaMemcpyDeviceToHost, stream);
+#else
+    trim_error = cudaMemcpy(&nedges, src, sizeof(u32), cudaMemcpyDeviceToHost);
+#endif
   }
   u32 trim() {
     nedges = 0;
@@ -857,12 +1093,17 @@ struct edgetrimmer {
     cudaEvent_t timingStart, timingStop;
     checkCudaErrors(cudaEventCreate(&timingStart));
     checkCudaErrors(cudaEventCreate(&timingStop));
-    float timingSeedA = 0.0f, timingSeedB = 0.0f, timingRound0 = 0.0f;
+    float timingSeedA = 0.0f, timingSeedB = 0.0f;
+#if TRIM_CUDA_GRAPH
+    float timingGraph = 0.0f;
+#else
+    float timingRound0 = 0.0f;
     float timingRound1 = 0.0f, timingRound2 = 0.0f, timingRound3 = 0.0f;
     float timingLate = 0.0f, timingTail = 0.0f;
-#define TARI_TIMING_BEGIN() cudaEventRecord(timingStart, 0)
+#endif
+#define TARI_TIMING_BEGIN() cudaEventRecord(timingStart, stream)
 #define TARI_TIMING_END(dst) do { \
-      cudaEventRecord(timingStop, 0); \
+      cudaEventRecord(timingStop, stream); \
       cudaEventSynchronize(timingStop); \
       cudaEventElapsedTime(&(dst), timingStart, timingStop); \
     } while (0)
@@ -870,19 +1111,28 @@ struct edgetrimmer {
 #define TARI_TIMING_BEGIN() do {} while (0)
 #define TARI_TIMING_END(dst) do {} while (0)
 #endif
+#if TRIM_CUDA_GRAPH
+    // Rounds 0 to the final count copy run as one graph and are timed as one
+    // stage; host event syncs cannot be captured.
+#define TARI_ROUND_TIMING_BEGIN() do {} while (0)
+#define TARI_ROUND_TIMING_END(dst) do {} while (0)
+#else
+#define TARI_ROUND_TIMING_BEGIN() TARI_TIMING_BEGIN()
+#define TARI_ROUND_TIMING_END(dst) TARI_TIMING_END(dst)
+#endif
 #if SQUASH_OUTPUT
     TARI_TIMING_BEGIN();
-    cudaMemset(indexesE[1], 0, indexesSize);
-    SeedA<EDGES_A><<<tp.genA.blocks, tp.genA.tpb>>>(sipkeys, (ulonglong4*)bufferAB, indexesE[1]);
+    memset_zero(indexesE[1], indexesSize);
+    SeedA<EDGES_A><<<tp.genA.blocks, tp.genA.tpb, 0, stream>>>(sipkeys, (ulonglong4*)bufferAB, indexesE[1]);
     TARI_TIMING_END(timingSeedA);
     if (abort) return false;
 
     TARI_TIMING_BEGIN();
-    cudaMemset(indexesE[0], 0, indexesSize);
+    memset_zero(indexesE[0], indexesSize);
     qA = sizeA/NA;
     qE = NX2 / NA;
     for (u32 i = 0; i < NA; i++) {
-      SeedB<EDGES_A><<<tp.genB.blocks/NA, tp.genB.tpb>>>((uint2*)(bufferAB+i*qA), (ulonglong4*)(bufferA+i*qA), indexesE[1]+i*qE, indexesE[0]+i*qE);
+      SeedB<EDGES_A><<<tp.genB.blocks/NA, tp.genB.tpb, 0, stream>>>((uint2*)(bufferAB+i*qA), (ulonglong4*)(bufferA+i*qA), indexesE[1]+i*qE, indexesE[0]+i*qE);
       if (abort) return false;
     }
     TARI_TIMING_END(timingSeedB);
@@ -919,100 +1169,174 @@ struct edgetrimmer {
     if (abort) return false;
 #endif
 
-    TARI_TIMING_BEGIN();
-    for (u32 i = 0; i < NB; i++) cudaMemset(indexesE[1+i], 0, indexesSize);
+    // Round 0 through the final count copy. Every parameter here is fixed per
+    // context, so with TRIM_CUDA_GRAPH this is captured once into a graph.
+    // Returns false if aborted.
+    auto rounds = [&]() -> bool {
+    TARI_ROUND_TIMING_BEGIN();
+    for (u32 i = 0; i < NB; i++) memset_zero(indexesE[1+i], indexesSize);
 
     qA = sizeA/NB;
     const size_t qB = sizeB/NB;
     qE = NX2 / NB;
     for (u32 i = NB; i--; ) {
 #if ROUND0_DST_HASH_DYNAMIC_BITS
-      Round0DstHashDynamic<EDGES_A, EDGES_B/NB><<<tp.trim.blocks/NB, ROUND0_TPB ? ROUND0_TPB : tp.trim.tpb, ROUND0_DST_HASH_DYNAMIC_WORDS * sizeof(u32)>>>((uint2*)(bufferA+i*qA), (uint2*)(bufferB+i*qB), indexesE[0]+i*qE, indexesE[1+i]);
+      Round0DstHashDynamic<EDGES_A, EDGES_B/NB><<<tp.trim.blocks/NB, ROUND0_TPB ? ROUND0_TPB : tp.trim.tpb, ROUND0_DST_HASH_DYNAMIC_WORDS * sizeof(u32), stream>>>((uint2*)(bufferA+i*qA), (uint2*)(bufferB+i*qB), indexesE[0]+i*qE, indexesE[1+i]);
 #else
-      Round<1, EDGES_A, EDGES_B/NB, 0, 1><<<tp.trim.blocks/NB, ROUND0_TPB ? ROUND0_TPB : tp.trim.tpb>>>((uint2*)(bufferA+i*qA), (uint2*)(bufferB+i*qB), indexesE[0]+i*qE, indexesE[1+i]); // to .632
+      Round<1, EDGES_A, EDGES_B/NB, 0, 1><<<tp.trim.blocks/NB, ROUND0_TPB ? ROUND0_TPB : tp.trim.tpb, 0, stream>>>((uint2*)(bufferA+i*qA), (uint2*)(bufferB+i*qB), indexesE[0]+i*qE, indexesE[1+i]); // to .632
 #endif
       if (abort) return false;
     }
-    TARI_TIMING_END(timingRound0);
+    TARI_ROUND_TIMING_END(timingRound0);
 
-    TARI_TIMING_BEGIN();
-    cudaMemset(indexesE[0], 0, indexesSize);
+    TARI_ROUND_TIMING_BEGIN();
+    memset_zero(indexesE[0], indexesSize);
 
-    Round<NB, EDGES_B/NB, EDGES_B/2, 1, !SKIP_LATE_NULL_CHECKS><<<tp.trim.blocks, ROUND1_TPB ? ROUND1_TPB : tp.trim.tpb>>>((const uint2 *)bufferB, (uint2 *)bufferA, indexesE[1], indexesE[0]); // to .296
+    Round<NB, EDGES_B/NB, EDGES_B/2, 1, !SKIP_LATE_NULL_CHECKS><<<tp.trim.blocks, ROUND1_TPB ? ROUND1_TPB : tp.trim.tpb, 0, stream>>>((const uint2 *)bufferB, (uint2 *)bufferA, indexesE[1], indexesE[0]); // to .296
     if (abort) return false;
-    TARI_TIMING_END(timingRound1);
+    TARI_ROUND_TIMING_END(timingRound1);
 
-    TARI_TIMING_BEGIN();
-    cudaMemset(indexesE[1], 0, indexesSize);
+    TARI_ROUND_TIMING_BEGIN();
+    memset_zero(indexesE[1], indexesSize);
 
-    Round<1, EDGES_B/2, EDGES_A/4, 0, !SKIP_LATE_NULL_CHECKS><<<tp.trim.blocks, ROUND23_TPB ? ROUND23_TPB : tp.trim.tpb>>>((const uint2 *)bufferA, (uint2 *)bufferB, indexesE[0], indexesE[1]); // to .176
+    Round<1, EDGES_B/2, EDGES_A/4, 0, !SKIP_LATE_NULL_CHECKS, LATE_ROUND_SELF_ZERO_IDX><<<tp.trim.blocks, ROUND23_TPB ? ROUND23_TPB : tp.trim.tpb, 0, stream>>>((const uint2 *)bufferA, (uint2 *)bufferB, indexesE[0], indexesE[1]); // to .176
     if (abort) return false;
-    TARI_TIMING_END(timingRound2);
+    TARI_ROUND_TIMING_END(timingRound2);
 
-    TARI_TIMING_BEGIN();
-    cudaMemset(indexesE[0], 0, indexesSize);
+    TARI_ROUND_TIMING_BEGIN();
+#if !LATE_ROUND_SELF_ZERO_IDX
+    memset_zero(indexesE[0], indexesSize);
+#endif // else Round 2 zeroed indexesE[0], its source
 
-    Round<1, EDGES_A/4, EDGES_B/4, 1, !SKIP_LATE_NULL_CHECKS><<<tp.trim.blocks, ROUND23_TPB ? ROUND23_TPB : tp.trim.tpb>>>((const uint2 *)bufferB, (uint2 *)bufferA, indexesE[1], indexesE[0]); // to .117
+    Round<1, EDGES_A/4, EDGES_B/4, 1, !SKIP_LATE_NULL_CHECKS, LATE_ROUND_SELF_ZERO_IDX><<<tp.trim.blocks, ROUND23_TPB ? ROUND23_TPB : tp.trim.tpb, 0, stream>>>((const uint2 *)bufferB, (uint2 *)bufferA, indexesE[1], indexesE[0]); // to .117
     if (abort) return false;
-    TARI_TIMING_END(timingRound3);
+    TARI_ROUND_TIMING_END(timingRound3);
 
 #if !SQUASH_OUTPUT
     cudaDeviceSynchronize();
 #endif
 
-    TARI_TIMING_BEGIN();
+    TARI_ROUND_TIMING_BEGIN();
+    // With LATE_ROUND_SELF_ZERO_IDX every round from Round 2 on zeroes the
+    // index buffer it read, which is the destination of the next kernel:
+    // Round 3 leaves indexesE[1] clear, each first late round indexesE[0] and
+    // each second late round indexesE[1] again.
     for (int round = 4; round < tp.ntrims; round += 2) {
-      cudaMemset(indexesE[1], 0, indexesSize);
-      Round<1, EDGES_B/4, EDGES_B/4, 0, !SKIP_LATE_NULL_CHECKS><<<tp.trim.blocks, ROUND_LATE_TPB ? ROUND_LATE_TPB : tp.trim.tpb>>>((const uint2 *)bufferA, (uint2 *)bufferB, indexesE[0], indexesE[1]);
+#if !LATE_ROUND_SELF_ZERO_IDX
+      memset_zero(indexesE[1], indexesSize);
+#endif
+#if LATE_ROUND_BPB > 1
+      RoundMulti<EDGES_B/4, EDGES_B/4, 0, !SKIP_LATE_NULL_CHECKS, LATE_ROUND_BPB, LATE_ROUND_SELF_ZERO_IDX><<<tp.trim.blocks / LATE_ROUND_BPB, ROUND_LATE_TPB ? ROUND_LATE_TPB : tp.trim.tpb, LATE_ROUND_MULTI_SMEM, stream>>>((const uint2 *)bufferA, (uint2 *)bufferB, indexesE[0], indexesE[1]);
+#else
+      Round<1, EDGES_B/4, EDGES_B/4, 0, !SKIP_LATE_NULL_CHECKS, LATE_ROUND_SELF_ZERO_IDX><<<tp.trim.blocks, ROUND_LATE_TPB ? ROUND_LATE_TPB : tp.trim.tpb, 0, stream>>>((const uint2 *)bufferA, (uint2 *)bufferB, indexesE[0], indexesE[1]);
+#endif
       if (abort) return false;
 #if FUSE_FINAL_TAIL_CURRENT
       if (round + 2 >= tp.ntrims) {
-        cudaMemset(indexesE[0], 0, indexesSize);
-        FusedFinalTail<EDGES_B/4><<<tp.trim.blocks, ROUND_LATE_TPB ? ROUND_LATE_TPB : tp.trim.tpb>>>((const uint2 *)bufferB, (uint2 *)bufferA, indexesE[1], indexesE[0]);
+#if !LATE_ROUND_SELF_ZERO_IDX
+        memset_zero(indexesE[0], indexesSize);
+#endif
+        FusedFinalTail<EDGES_B/4><<<tp.trim.blocks, ROUND_LATE_TPB ? ROUND_LATE_TPB : tp.trim.tpb, 0, stream>>>((const uint2 *)bufferB, (uint2 *)bufferA, indexesE[1], indexesE[0]);
         if (abort) return false;
         break;
       }
 #endif
-      cudaMemset(indexesE[0], 0, indexesSize);
-      Round<1, EDGES_B/4, EDGES_B/4, 1, !SKIP_LATE_NULL_CHECKS><<<tp.trim.blocks, ROUND_LATE_TPB ? ROUND_LATE_TPB : tp.trim.tpb>>>((const uint2 *)bufferB, (uint2 *)bufferA, indexesE[1], indexesE[0]);
+#if !LATE_ROUND_SELF_ZERO_IDX
+      memset_zero(indexesE[0], indexesSize);
+#endif
+#if LATE_ROUND_BPB > 1
+      RoundMulti<EDGES_B/4, EDGES_B/4, 1, !SKIP_LATE_NULL_CHECKS, LATE_ROUND_BPB, LATE_ROUND_SELF_ZERO_IDX><<<tp.trim.blocks / LATE_ROUND_BPB, ROUND_LATE_TPB ? ROUND_LATE_TPB : tp.trim.tpb, LATE_ROUND_MULTI_SMEM, stream>>>((const uint2 *)bufferB, (uint2 *)bufferA, indexesE[1], indexesE[0]);
+#else
+      Round<1, EDGES_B/4, EDGES_B/4, 1, !SKIP_LATE_NULL_CHECKS, LATE_ROUND_SELF_ZERO_IDX><<<tp.trim.blocks, ROUND_LATE_TPB ? ROUND_LATE_TPB : tp.trim.tpb, 0, stream>>>((const uint2 *)bufferB, (uint2 *)bufferA, indexesE[1], indexesE[0]);
+#endif
       if (abort) return false;
     }
-    TARI_TIMING_END(timingLate);
+    TARI_ROUND_TIMING_END(timingLate);
 
 #if FUSE_FINAL_TAIL_CURRENT
-    TARI_TIMING_BEGIN();
-    trim_error =
-        cudaMemcpy(&nedges, indexesE[0], sizeof(u32), cudaMemcpyDeviceToHost);
-    TARI_TIMING_END(timingTail);
+    TARI_ROUND_TIMING_BEGIN();
+    copy_count(indexesE[0]);
+    TARI_ROUND_TIMING_END(timingTail);
 #else
+    TARI_ROUND_TIMING_BEGIN();
+#if !LATE_ROUND_SELF_ZERO_IDX
+    memset_zero(indexesE[1], indexesSize);
+#endif // else the last reader of indexesE[1] (Round 3 or a late round) zeroed it
+#if !SQUASH_OUTPUT
+    cudaDeviceSynchronize();
+#endif
+    Tail<EDGES_B/4><<<tp.tail.blocks, tp.tail.tpb, 0, stream>>>((const uint2 *)bufferA, (uint2 *)bufferB, indexesE[0], indexesE[1]);
+    copy_count(indexesE[1]);
+    TARI_ROUND_TIMING_END(timingTail);
+#endif
+#if !SQUASH_OUTPUT
+    cudaDeviceSynchronize();
+#endif
+    return true;
+    }; // rounds
+
+#if TRIM_CUDA_GRAPH
+    // The graph has no abort checks between its launches; check once here.
+    if (abort) return false;
+    if (!graphExec || graphNtrims != tp.ntrims) {
+      if (graphExec) {
+        cudaGraphExecDestroy(graphExec);
+        graphExec = nullptr;
+      }
+      cudaGraph_t graph = nullptr;
+      bool complete = false;
+      trim_error = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
+      if (trim_error == cudaSuccess) {
+        complete = rounds();
+        trim_error = cudaStreamEndCapture(stream, &graph);
+      }
+      if (trim_error == cudaSuccess && complete)
+        trim_error = cudaGraphInstantiateWithFlags(&graphExec, graph, 0);
+      if (graph)
+        cudaGraphDestroy(graph);
+      if (trim_error != cudaSuccess) {
+        graphExec = nullptr;
+        gpuAssert(trim_error, __FILE__, __LINE__); // records LAST_ERROR_REASON
+        return 0;
+      }
+      if (!complete) // aborted while capturing; capture again next time
+        return false;
+      graphNtrims = tp.ntrims;
+    }
     TARI_TIMING_BEGIN();
-    cudaMemset(indexesE[1], 0, indexesSize);
-#if !SQUASH_OUTPUT
-    cudaDeviceSynchronize();
-#endif
-    Tail<EDGES_B/4><<<tp.tail.blocks, tp.tail.tpb>>>((const uint2 *)bufferA, (uint2 *)bufferB, indexesE[0], indexesE[1]);
-    trim_error =
-        cudaMemcpy(&nedges, indexesE[1], sizeof(u32), cudaMemcpyDeviceToHost);
-    TARI_TIMING_END(timingTail);
-#endif
-#if !SQUASH_OUTPUT
-    cudaDeviceSynchronize();
+    trim_error = cudaGraphLaunch(graphExec, stream);
+    if (trim_error == cudaSuccess)
+      trim_error = cudaStreamSynchronize(stream);
+    TARI_TIMING_END(timingGraph);
+    if (trim_error == cudaSuccess)
+      nedges = *hostCount;
+#else
+    if (!rounds()) return false;
 #endif
 #if TRIM_STAGE_TIMING
+#if TRIM_CUDA_GRAPH
+    printf("stage-ms SeedA %.3f SeedB %.3f graph(R0..tail) %.3f\n",
+           timingSeedA, timingSeedB, timingGraph);
+#else
     printf("stage-ms SeedA %.3f SeedB %.3f R0 %.3f R1 %.3f R2 %.3f R3 %.3f late %.3f tail %.3f\n",
            timingSeedA, timingSeedB, timingRound0, timingRound1, timingRound2,
            timingRound3, timingLate, timingTail);
+#endif
     checkCudaErrors(cudaEventDestroy(timingStart));
     checkCudaErrors(cudaEventDestroy(timingStop));
 #endif
 #undef TARI_TIMING_BEGIN
 #undef TARI_TIMING_END
+#undef TARI_ROUND_TIMING_BEGIN
+#undef TARI_ROUND_TIMING_END
     return trim_error == cudaSuccess ? nedges : 0;
   }
 };
 
 struct SolverTrimResult {
   u32 nedges = 0;
+  // Surviving edges before the MAXEDGES cap (nedges is capped). Statistics only.
+  u32 uncapped_nedges = 0;
   cudaError_t cuda_error = cudaSuccess;
 };
 
@@ -1024,6 +1348,10 @@ struct solver_ctx {
   graph<word_t> cg;
   uint2 soledges[PROOFSIZE];
   std::vector<u32> sols; // concatenation of all proof's indices
+  // Wall time (steady clock) of the last findcycles_with_keys host search:
+  // graph reset, edge inserts and cycle finding, not the GPU recovery of
+  // any cycle found. Statistics only.
+  double last_host_search_sec = 0.0;
 #if RECOVERY_SMALL_OUTPUT
   u32 *recoverIndexes;
 #endif
@@ -1067,9 +1395,12 @@ struct solver_ctx {
   }
 
   int findcycles_with_keys(uint2 *edges, u32 nedges, const siphash_keys &keys, std::vector<u32> &outSols) {
+    const auto search_start = std::chrono::steady_clock::now();
     cg.reset();
     for (u32 i = 0; i < nedges; i++)
       cg.add_compress_edge(edges[i].x, edges[i].y);
+    last_host_search_sec = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - search_start).count();
     for (u32 s = 0 ;s < cg.nsols; s++) {
       // print_log("Solution");
       for (u32 j = 0; j < PROOFSIZE; j++) {
@@ -1082,32 +1413,40 @@ struct solver_ctx {
       // a verification failure.
       const size_t solbase = outSols.size();
       outSols.resize(solbase + PROOFSIZE);
+#if TRIM_CUDA_GRAPH
+      // Ordered on the trimmer's stream: a pageable host-to-device copy may
+      // still be in flight when the blocking call returns.
+      cudaError_t rc = cudaMemcpyToSymbolAsync(recoveredges, soledges, sizeof(soledges), 0,
+                                               cudaMemcpyHostToDevice, trimmer.stream);
+#else
       cudaError_t rc = cudaMemcpyToSymbol(recoveredges, soledges, sizeof(soledges));
+#endif
 #if RECOVERY_SMALL_OUTPUT
       if (rc == cudaSuccess)
-        rc = cudaMemset(recoverIndexes, 0, PROOFSIZE * sizeof(u32));
+        rc = trimmer.memset_zero(recoverIndexes, PROOFSIZE * sizeof(u32));
       if (rc == cudaSuccess) {
-        Recovery<<<trimmer.tp.recover.blocks, trimmer.tp.recover.tpb>>>(keys, (ulonglong4*)trimmer.bufferA, (int *)recoverIndexes);
+        Recovery<<<trimmer.tp.recover.blocks, trimmer.tp.recover.tpb, 0, trimmer.stream>>>(keys, (ulonglong4*)trimmer.bufferA, (int *)recoverIndexes);
         rc = cudaGetLastError();
       }
       if (rc == cudaSuccess)
-        rc = cudaMemcpy(&outSols[solbase], recoverIndexes,
-                        PROOFSIZE * sizeof(u32), cudaMemcpyDeviceToHost);
+        rc = trimmer.copy_to_host(&outSols[solbase], recoverIndexes,
+                                  PROOFSIZE * sizeof(u32));
 #else
       if (rc == cudaSuccess)
-        rc = cudaMemset(trimmer.indexesE[1], 0, trimmer.indexesSize);
+        rc = trimmer.memset_zero(trimmer.indexesE[1], trimmer.indexesSize);
       if (rc == cudaSuccess) {
-        Recovery<<<trimmer.tp.recover.blocks, trimmer.tp.recover.tpb>>>(keys, (ulonglong4*)trimmer.bufferA, (int *)trimmer.indexesE[1]);
+        Recovery<<<trimmer.tp.recover.blocks, trimmer.tp.recover.tpb, 0, trimmer.stream>>>(keys, (ulonglong4*)trimmer.bufferA, (int *)trimmer.indexesE[1]);
         rc = cudaGetLastError();
       }
       if (rc == cudaSuccess)
-        rc = cudaMemcpy(&outSols[solbase], trimmer.indexesE[1],
-                        PROOFSIZE * sizeof(u32), cudaMemcpyDeviceToHost);
+        rc = trimmer.copy_to_host(&outSols[solbase], trimmer.indexesE[1],
+                                  PROOFSIZE * sizeof(u32));
 #endif
-      // Recovery uses the calling thread's default stream. Synchronizing that
-      // stream preserves overlap with trims running in other host threads.
+      // Recovery uses the trimmer's stream (the calling thread's default
+      // stream unless TRIM_CUDA_GRAPH). Synchronizing only that stream
+      // preserves overlap with trims running in other host threads.
       if (rc == cudaSuccess)
-        rc = cudaStreamSynchronize(0);
+        rc = cudaStreamSynchronize(trimmer.stream);
       if (rc != cudaSuccess) {
         outSols.resize(solbase);
         return gpuAssert(rc, __FILE__, __LINE__);
@@ -1142,7 +1481,8 @@ struct solver_ctx {
     return trim_copy_to(edges);
   }
 
-  u32 trim_copy_to(uint2 *outEdges, cudaError_t *copy_error = nullptr) {
+  u32 trim_copy_to(uint2 *outEdges, cudaError_t *copy_error = nullptr,
+                   u32 *uncapped_nedges = nullptr) {
 #if TRIM_STAGE_TIMING
     cudaEvent_t copyStart, copyStop;
     checkCudaErrors(cudaEventCreate(&copyStart));
@@ -1150,6 +1490,8 @@ struct solver_ctx {
 #endif
     if (copy_error)
       *copy_error = cudaSuccess;
+    if (uncapped_nedges)
+      *uncapped_nedges = 0;
     trimmer.abort = false;
     u32 nedges = trimmer.trim();
     if (trimmer.trim_error != cudaSuccess) {
@@ -1157,6 +1499,8 @@ struct solver_ctx {
         *copy_error = trimmer.trim_error;
       return 0;
     }
+    if (uncapped_nedges)
+      *uncapped_nedges = nedges;
     if (!nedges) {
 #if TRIM_STAGE_TIMING
       checkCudaErrors(cudaEventDestroy(copyStart));
@@ -1169,19 +1513,19 @@ struct solver_ctx {
       nedges = MAXEDGES;
     }
 #if TRIM_STAGE_TIMING
-    cudaEventRecord(copyStart, 0);
+    cudaEventRecord(copyStart, trimmer.stream);
 #endif
-    cudaError_t edge_copy_error = cudaMemcpy(outEdges,
+    cudaError_t edge_copy_error = trimmer.copy_to_host(outEdges,
 #if FUSE_FINAL_TAIL_CURRENT
                trimmer.bufferA,
 #else
                trimmer.bufferB,
 #endif
-               sizeof(uint2) * (size_t)nedges, cudaMemcpyDeviceToHost); // [tari-c29 patch] VLA-sizeof -> explicit
+               sizeof(uint2) * (size_t)nedges); // [tari-c29 patch] VLA-sizeof -> explicit
     if (copy_error)
       *copy_error = edge_copy_error;
 #if TRIM_STAGE_TIMING
-    cudaEventRecord(copyStop, 0);
+    cudaEventRecord(copyStop, trimmer.stream);
     cudaEventSynchronize(copyStop);
     float copyMs = 0.0f;
     cudaEventElapsedTime(&copyMs, copyStart, copyStop);
@@ -1213,18 +1557,20 @@ struct solver_ctx {
     }
 
     cudaError_t copy_rc = cudaSuccess;
-    result.nedges = trim_copy_to(outEdges, &copy_rc);
+    result.nedges = trim_copy_to(outEdges, &copy_rc, &result.uncapped_nedges);
 
-    // All trim work uses the calling thread's default stream. The release
-    // build selects per-thread default streams, so this detects asynchronous
-    // execution failures without serializing other pipeline slots.
-    cudaError_t sync_rc = cudaStreamSynchronize(0);
+    // All trim work uses the trimmer's stream: the calling thread's default
+    // stream (the release build selects per-thread default streams), or its
+    // own stream with TRIM_CUDA_GRAPH. This detects asynchronous execution
+    // failures without serializing other pipeline slots.
+    cudaError_t sync_rc = cudaStreamSynchronize(trimmer.stream);
     cudaError_t last_rc = cudaGetLastError();
     result.cuda_error = copy_rc != cudaSuccess
         ? copy_rc
         : (sync_rc != cudaSuccess ? sync_rc : last_rc);
 #if TARI_TEST_FORCE_ZERO_YIELD
     result.nedges = 0;
+    result.uncapped_nedges = 0;
 #endif
 #if TARI_TEST_FORCE_CUDA_ERROR
     // Exercise the same fatal path with a real CUDA runtime error rather than
@@ -1362,6 +1708,15 @@ CALL_CONVENTION SolverCtx* create_solver_ctx(SolverParams* params) {
 
   cudaDeviceProp prop;
   checkCudaErrors_N(cudaGetDeviceProperties(&prop, params->device));
+#if TARI_GPU_HIP
+  // The kernels use 32-bit lane masks, so only wave32 devices (RDNA) work.
+  if (prop.warpSize != 32) {
+    snprintf(LAST_ERROR_REASON, MAX_NAME_LEN,
+             "device %d (%s, %s) runs %d-lane wavefronts; this build needs 32-lane wavefronts (RDNA2, RDNA3 or RDNA4)",
+             params->device, prop.name, prop.gcnArchName, prop.warpSize);
+    return NULL;
+  }
+#endif
 
   assert(tp.genA.tpb <= prop.maxThreadsPerBlock);
   assert(tp.genB.tpb <= prop.maxThreadsPerBlock);
@@ -1398,12 +1753,12 @@ CALL_CONVENTION void fill_default_params(SolverParams* params) {
   trimparams tp;
   params->device = 0;
   params->ntrims = tp.ntrims;
-  params->genablocks = min(tp.genA.blocks, NEDGES/EDGE_BLOCK_SIZE/tp.genA.tpb);
+  params->genablocks = min((u32)tp.genA.blocks, NEDGES/EDGE_BLOCK_SIZE/tp.genA.tpb);
   params->genatpb = tp.genA.tpb;
   params->genbtpb = tp.genB.tpb;
   params->trimtpb = tp.trim.tpb;
   params->tailtpb = tp.tail.tpb;
-  params->recoverblocks = min(tp.recover.blocks, NEDGES/EDGE_BLOCK_SIZE/tp.recover.tpb);
+  params->recoverblocks = min((u32)tp.recover.blocks, NEDGES/EDGE_BLOCK_SIZE/tp.recover.tpb);
   params->recovertpb = tp.recover.tpb;
   params->cpuload = false;
 }
